@@ -1,0 +1,9 @@
+{
+	// ...
+	"compilerOptions": {
+		"module": "esnext",
+		"lib": ["esnext", "dom", "dom.iterable"],
+		"types": ["@webgpu/types"]
+	},
+	"include": ["src/**/*"]
+}
