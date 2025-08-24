@@ -10,9 +10,9 @@ MacOS Genie Effect 是苹果操作系统中一个标志性的窗口最小化动�
 
 本项目使用 WebGPU 技术在浏览器中重现了这一经典动画效果，无需任何插件或额外依赖。
 
-## 功能特点
+## 效果
 
-- 还原 MacOS Genie Effect 动画效果
+![MacOS Genie Effect 效果](./md-assets/genie-2.gif)
 
 ## 快速开始
 
