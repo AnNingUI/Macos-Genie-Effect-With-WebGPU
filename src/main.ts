@@ -1,5 +1,5 @@
-import genie_f from "./shader/Genie.fragment.wgsl?raw";
-import genie_v from "./shader/Genie.vertex.wgsl?raw";
+import genie_f from "./shaders/effect/Genie.fragment.wgsl?raw";
+import genie_v from "./shaders/effect/Genie.vertex.wgsl?raw";
 // --- Utility Functions ---
 function lerp(start: number, end: number, t: number): number {
 	return start + (end - start) * t;
@@ -439,17 +439,21 @@ class WebGPUApp {
 	}
 
 	updateCanvasDimsBuffer(): void {
+		if (!this.canvasDimsBuffer) return;
 		const dimsData = new Float32Array([this.canvasWidth, this.canvasHeight]);
 		this.device.queue.writeBuffer(this.canvasDimsBuffer, 0, dimsData);
 	}
 
 	setupUI(): void {
-		document
-			.getElementById("genie-btn")
-			.addEventListener("click", () => this.startAnimation());
-		document
-			.getElementById("reset-btn")
-			.addEventListener("click", () => this.reset());
+		const genieBtn = document.getElementById("genie-btn");
+		const resetBtn = document.getElementById("reset-btn");
+		
+		if (genieBtn) {
+			genieBtn.addEventListener("click", () => this.startAnimation());
+		}
+		if (resetBtn) {
+			resetBtn.addEventListener("click", () => this.reset());
+		}
 	}
 
 	startAnimation(): void {
@@ -474,20 +478,26 @@ class WebGPUApp {
 
 	finishAnimation(): void {
 		this.isAnimating = false;
-		cancelAnimationFrame(this.animationId);
+		if (this.animationId !== null) {
+			cancelAnimationFrame(this.animationId);
+		}
 		// Final render at the end of animation
 		this.render(this.animationDuration);
 	}
 
 	reset(): void {
 		if (this.isAnimating) {
-			cancelAnimationFrame(this.animationId);
+			if (this.animationId !== null) {
+				cancelAnimationFrame(this.animationId);
+			}
 			this.isAnimating = false;
 		}
 		this.render(0); // Render initial state
 	}
 
 	render(timeInSeconds: number): void {
+		if (!this.uniformBuffer || !this.pipeline || !this.indexBuffer) return;
+		
 		// Update uniform buffer with current time and parameters
 		const uniformData = new Float32Array([
 			timeInSeconds, // time
@@ -519,12 +529,14 @@ class WebGPUApp {
 		);
 
 		// Draw animated window
-		passEncoder.setPipeline(this.pipeline);
-		passEncoder.setBindGroup(0, this.bindGroup0);
-		passEncoder.setBindGroup(1, this.bindGroup1);
-		passEncoder.setVertexBuffer(0, this.vertexBuffer);
-		passEncoder.setIndexBuffer(this.indexBuffer, "uint16");
-		passEncoder.drawIndexed(6);
+		if (this.pipeline && this.indexBuffer) {
+			passEncoder.setPipeline(this.pipeline);
+			passEncoder.setBindGroup(0, this.bindGroup0);
+			passEncoder.setBindGroup(1, this.bindGroup1);
+			passEncoder.setVertexBuffer(0, this.vertexBuffer);
+			passEncoder.setIndexBuffer(this.indexBuffer, "uint16");
+			passEncoder.drawIndexed(6);
+		}
 
 		passEncoder.end();
 		this.device.queue.submit([commandEncoder.finish()]);
