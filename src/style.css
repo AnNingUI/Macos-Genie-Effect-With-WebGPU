@@ -1,0 +1,304 @@
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  background: #000;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  color: #fff;
+  overflow: hidden;
+}
+
+#stage {
+  position: relative;
+  width: 800px;
+  height: 600px;
+  /* 用 outline 代替 border：border 会挤占内容盒，
+     让 canvas 的实际 CSS 尺寸变成 796×596，与后备缓冲 800×600 不一致 → 拉伸模糊 */
+  outline: 2px solid #444;
+  overflow: hidden;
+  background: linear-gradient(to bottom, #1a1a2e, #16213e);
+}
+
+#webgpu-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  /* canvas 的位图由 WebGPU 输出，禁止浏览器做平滑放大 */
+  image-rendering: auto;
+}
+
+/* ==================== 真实 HTML 窗口（会被捕获成纹理） ====================
+   ⚠️ 两个必须遵守的点：
+
+   1. **不要设 opacity: 0** —— 普通 div 设了会让捕获出的纹理变空
+      （paint record 被优化掉），交互也会跟着消失。
+
+   2. **不要设 pointer-events: none** —— 那样元素彻底收不到鼠标/键盘事件，
+      用户点上去毫无反应。命中的前提是 updateElementGeometry 给出的几何正确，
+      而不是把指针事件关掉。 */
+#genie-window {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 800px;
+  height: 600px;
+
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+
+  border-radius: 10px;
+  background: #f5f5f7;
+  color: #1d1d1f;
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+  box-shadow: 0 22px 60px rgba(0, 0, 0, 0.55);
+
+  /* 允许接收指针事件（默认值，这里显式写出以示关键） */
+  pointer-events: auto;
+}
+
+/* ---------- 标题栏 ---------- */
+.titlebar {
+  flex: 0 0 auto;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 14px;
+  background: linear-gradient(180deg, #ececf0 0%, #dcdce2 100%);
+  border-bottom: 1px solid rgba(0, 0, 0, 0.12);
+}
+
+.lights { display: flex; gap: 8px; }
+
+.light {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  display: block;
+}
+.light.close { background: #ff5f57; }
+.light.min { background: #febc2e; }
+.light.max { background: #28c840; }
+
+.title {
+  flex: 1;
+  text-align: center;
+  font-size: 13px;
+  font-weight: 600;
+  color: #4a4a4f;
+  letter-spacing: -0.01em;
+}
+
+.titlebar-right { width: 56px; }
+
+/* ---------- 主体 ---------- */
+.body {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+
+.sidebar {
+  flex: 0 0 180px;
+  padding: 16px 10px;
+  background: #ebebef;
+  border-right: 1px solid rgba(0, 0, 0, 0.08);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.side-item {
+  padding: 8px 12px;
+  border-radius: 7px;
+  font-size: 13px;
+  color: #57575c;
+}
+
+.side-item.active {
+  background: #d8d8de;
+  color: #1d1d1f;
+  font-weight: 600;
+}
+
+.content {
+  flex: 1;
+  padding: 24px 28px;
+  overflow: hidden;
+  background: #fbfbfd;
+}
+
+.content h1 {
+  font-size: 24px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  margin-bottom: 4px;
+}
+
+.meta {
+  font-size: 12px;
+  color: #8e8e93;
+  margin-bottom: 18px;
+}
+
+.todos {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 20px;
+}
+
+.todos li label {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 14px;
+  color: #2c2c2e;
+}
+
+.todos li label:hover { background: #f0f0f4; }
+
+.todos input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  accent-color: #0a84ff;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+
+.todos input[type="checkbox"]:checked + span {
+  color: #a1a1a6;
+  text-decoration: line-through;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.field > span {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #8e8e93;
+}
+
+.field input {
+  padding: 10px 12px;
+  font-size: 14px;
+  font-family: inherit;
+  color: #1d1d1f;
+  background: #fff;
+  border: 1px solid #d2d2d7;
+  border-radius: 9px;
+  outline: none;
+  transition: border-color 130ms ease, box-shadow 130ms ease;
+}
+
+.field input:focus {
+  border-color: #0a84ff;
+  box-shadow: 0 0 0 3px rgba(10, 132, 255, 0.18);
+}
+
+.hint {
+  margin-top: 16px;
+  font-size: 12px;
+  color: #8e8e93;
+}
+
+/* ==================== 控制区 ==================== */
+#controls {
+  margin-top: 15px;
+  padding: 10px 14px;
+  background: rgba(0, 0, 0, 0.5);
+  border-radius: 5px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+#dir-wrap {
+  margin-left: 8px;
+  font-size: 13px;
+  color: #ccc;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+#dir-select {
+  padding: 6px 8px;
+  font-size: 13px;
+  font-family: inherit;
+  color: #fff;
+  background: #2a2a30;
+  border: 1px solid #444;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+button {
+  margin: 5px;
+  padding: 8px 14px;
+  font-size: 13px;
+  font-family: inherit;
+  background: #4caf50;
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+button:hover { background: #45a049; }
+button:disabled { background: #3a3a3a; color: #888; cursor: default; }
+
+#info {
+  margin-top: 10px;
+  font-size: 14px;
+  color: #ccc;
+  text-align: center;
+}
+
+/* ==================== 不支持提示 ==================== */
+#unsupported {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  padding: 32px;
+  text-align: center;
+  background: #06070a;
+  color: #e8eefc;
+  z-index: 10;
+}
+
+#unsupported[hidden] { display: none; }
+#unsupported h2 { font-size: 20px; font-weight: 650; }
+#unsupported p {
+  max-width: 520px;
+  font-size: 13.5px;
+  color: rgba(232, 238, 252, 0.62);
+  line-height: 1.6;
+}
+#unsupported code {
+  padding: 2px 6px;
+  font-size: 12.5px;
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.1);
+}
