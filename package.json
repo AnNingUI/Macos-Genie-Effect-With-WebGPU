@@ -3,10 +3,16 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
+  "packageManager": "pnpm@11.10.0",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "node scripts/genie-check.mjs",
+    "check:browser": "node scripts/check.mjs",
+    "check:dpr": "node scripts/dpr-check.mjs",
+    "verify": "pnpm typecheck && pnpm test"
   },
   "devDependencies": {
     "@types/node": "^24.3.0",

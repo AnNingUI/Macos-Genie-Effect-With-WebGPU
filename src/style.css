@@ -19,8 +19,9 @@ body {
   /* 用 outline 代替 border：border 会挤占内容盒，
      让 canvas 的实际 CSS 尺寸变成 796×596，与后备缓冲 800×600 不一致 → 拉伸模糊 */
   outline: 2px solid #444;
-  overflow: hidden;
   background: linear-gradient(to bottom, #1a1a2e, #16213e);
+  /* ⚠️ 不能 overflow: hidden —— Dock 要溢出到画布下方 */
+  overflow: visible;
 }
 
 #webgpu-canvas {
@@ -30,6 +31,12 @@ body {
   background: transparent;
   /* canvas 的位图由 WebGPU 输出，禁止浏览器做平滑放大 */
   image-rendering: auto;
+  /* canvas 是 content="drawable"，子元素参与布局。
+     窗口是非全屏时尺寸由 JS 写入，必须隔离出去，否则窗口会反向撑大画布，
+     造成「画布尺寸 → 窗口尺寸 → 画布尺寸」的循环。
+     ⚠️ 只能用 layout paint，不能加 size —— size 会让 canvas 不再跟随
+     width/height:100% 重新布局，后备缓冲就永远停在旧值。 */
+  contain: layout paint;
 }
 
 /* ==================== 真实 HTML 窗口（会被捕获成纹理） ====================
@@ -41,7 +48,8 @@ body {
    2. **不要设 pointer-events: none** —— 那样元素彻底收不到鼠标/键盘事件，
       用户点上去毫无反应。命中的前提是 updateElementGeometry 给出的几何正确，
       而不是把指针事件关掉。 */
-#genie-window {
+.app-window {
+  /* left/top/width/height 全部由 main.ts 写入（拖拽 / 缩放 / 布局都改它） */
   position: absolute;
   top: 0;
   left: 0;
@@ -63,10 +71,43 @@ body {
   pointer-events: auto;
 }
 
+/* 聚焦窗口：阴影更深、标题栏更亮（模拟 macOS 的活跃/非活跃窗口） */
+.app-window:not(.is-focused) {
+  filter: saturate(0.85) brightness(0.97);
+}
+
+.app-window:not(.is-focused) .titlebar {
+  background: linear-gradient(180deg, #f2f2f5 0%, #e8e8ec 100%);
+}
+
+.app-window:not(.is-focused) .title {
+  color: #8e8e93;
+}
+
+/* 右下角缩放手柄 */
+.resize-grip {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 16px;
+  height: 16px;
+  cursor: nwse-resize;
+  z-index: 3;
+  background:
+    linear-gradient(135deg, transparent 45%, rgba(0, 0, 0, 0.18) 45%, rgba(0, 0, 0, 0.18) 55%, transparent 55%),
+    linear-gradient(135deg, transparent 65%, rgba(0, 0, 0, 0.18) 65%, rgba(0, 0, 0, 0.18) 75%, transparent 75%);
+  opacity: 0.6;
+  transition: opacity 120ms ease;
+}
+
+.resize-grip:hover { opacity: 1; }
+
 /* ---------- 标题栏 ---------- */
 .titlebar {
   flex: 0 0 auto;
   height: 40px;
+  cursor: grab;
+  user-select: none;
   display: flex;
   align-items: center;
   gap: 10px;
@@ -75,17 +116,48 @@ body {
   border-bottom: 1px solid rgba(0, 0, 0, 0.12);
 }
 
+.titlebar:active { cursor: grabbing; }
+
 .lights { display: flex; gap: 8px; }
 
+/* 交通灯：真实的 <button>，可点、可聚焦、有 hover 反馈 */
 .light {
   width: 12px;
   height: 12px;
+  padding: 0;
+  border: none;
   border-radius: 50%;
   display: block;
+  cursor: pointer;
+  position: relative;
+  transition: filter 120ms ease, transform 120ms ease;
 }
+
 .light.close { background: #ff5f57; }
 .light.min { background: #febc2e; }
 .light.max { background: #28c840; }
+
+/* 只在悬停整组灯时显示符号（和真实 macOS 一致） */
+.lights:hover .light::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 9px;
+  line-height: 12px;
+  font-weight: 700;
+  color: rgba(0, 0, 0, 0.55);
+}
+
+.lights:hover .light.close::after { content: "×"; }
+.lights:hover .light.min::after { content: "−"; }
+.lights:hover .light.max::after { content: "+"; }
+
+.light:hover { filter: brightness(0.92); }
+.light:active { transform: scale(0.9); }
+.light:focus-visible { outline: 2px solid #0a84ff; outline-offset: 2px; }
 
 .title {
   flex: 1;
@@ -230,24 +302,25 @@ body {
   gap: 4px;
 }
 
-#dir-wrap {
+#progress-wrap {
   margin-left: 8px;
   font-size: 13px;
   color: #ccc;
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
 }
 
-#dir-select {
-  padding: 6px 8px;
-  font-size: 13px;
-  font-family: inherit;
-  color: #fff;
-  background: #2a2a30;
-  border: 1px solid #444;
-  border-radius: 4px;
+#progress-range {
+  width: 220px;
+  accent-color: #4caf50;
   cursor: pointer;
+}
+
+#progress-value {
+  min-width: 3.2em;
+  font-variant-numeric: tabular-nums;
+  color: #9e9ea7;
 }
 
 button {
@@ -264,6 +337,58 @@ button {
 
 button:hover { background: #45a049; }
 button:disabled { background: #3a3a3a; color: #888; cursor: default; }
+
+#window-wrap {
+  margin-left: 8px;
+  font-size: 13px;
+  color: #ccc;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+#window-wrap select {
+  padding: 6px 8px;
+  font-size: 13px;
+  font-family: inherit;
+  color: #e8e8ee;
+  background: #23232b;
+  border: 1px solid #3a3a44;
+  border-radius: 5px;
+  cursor: pointer;
+  outline: none;
+}
+
+#window-wrap select:focus { border-color: #4caf50; }
+
+#dir-wrap,
+#target-wrap {
+  margin-left: 8px;
+  font-size: 13px;
+  color: #ccc;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+#dir-select {
+  padding: 6px 8px;
+  font-size: 13px;
+  font-family: inherit;
+  color: #e8e8ee;
+  background: #23232b;
+  border: 1px solid #3a3a44;
+  border-radius: 5px;
+  cursor: pointer;
+  outline: none;
+}
+
+#dir-select:focus { border-color: #4caf50; }
+
+#target-wrap input {
+  accent-color: #4caf50;
+  cursor: pointer;
+}
 
 #info {
   margin-top: 10px;
@@ -301,4 +426,260 @@ button:disabled { background: #3a3a3a; color: #888; cursor: default; }
   font-size: 12.5px;
   border-radius: 5px;
   background: rgba(255, 255, 255, 0.1);
+}
+
+
+/* ==================== Dock ====================
+   Dock 在 canvas **外面**（#stage 的子元素）：
+   如果在 canvas 里，它会被一起捕获进窗口纹理，Dock 就跟着窗口一起变形了。
+
+   停靠边由 JS 加上 .edge-bottom / .edge-top / .edge-left / .edge-right，
+   对应 4 个收缩方向。左右两边是纵向排列（类似 GNOME 的垂直 Dock）。 */
+#dock {
+  position: absolute;
+  padding: 8px;
+  display: flex;
+  gap: 8px;
+
+  background: rgba(255, 255, 255, 0.14);
+  backdrop-filter: blur(18px) saturate(160%);
+  -webkit-backdrop-filter: blur(18px) saturate(160%);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+  z-index: 20;
+  transition: all 180ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* 底部：横向 */
+#dock.edge-bottom {
+  left: 50%;
+  bottom: 8px;
+  transform: translateX(-50%);
+  flex-direction: row;
+  border-radius: 18px;
+}
+
+/* 顶部：横向，位于菜单栏下方（菜单栏本身 26px 高） */
+#dock.edge-top {
+  left: 50%;
+  top: 32px;
+  transform: translateX(-50%);
+  flex-direction: row;
+  border-radius: 18px;
+}
+
+/* 左侧：纵向 */
+#dock.edge-left {
+  left: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  flex-direction: column;
+  border-radius: 18px;
+}
+
+/* 右侧：纵向 */
+#dock.edge-right {
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  flex-direction: column;
+  border-radius: 18px;
+}
+
+/* 纵向排列时，tooltip 放到右边，避免超出画面 */
+#dock.edge-left .dock-label,
+#dock.edge-right .dock-label {
+  bottom: auto;
+  top: 50%;
+  transform: translateY(-50%) translateX(6px);
+}
+
+#dock.edge-left .dock-label {
+  left: calc(100% + 12px);
+}
+
+#dock.edge-right .dock-label {
+  left: auto;
+  right: calc(100% + 12px);
+}
+
+#dock.edge-left .dock-item:hover .dock-label,
+#dock.edge-right .dock-item:hover .dock-label {
+  transform: translateY(-50%) translateX(0);
+}
+
+.dock-item {
+  position: relative;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  border: none;
+  border-radius: 13px;
+  background: linear-gradient(180deg, #ffffff 0%, #e8e8ee 100%);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: transform 160ms cubic-bezier(0.34, 1.56, 0.64, 1);
+  box-shadow: 0 3px 8px rgba(0, 0, 0, 0.3);
+}
+
+.dock-item:hover { transform: translateY(-6px) scale(1.12); }
+.dock-item:active { transform: translateY(-3px) scale(1.02); }
+
+.dock-item.is-minimized {
+  box-shadow: 0 0 0 2px rgba(255, 214, 10, 0.9), 0 3px 8px rgba(0, 0, 0, 0.3);
+}
+
+.dock-glyph {
+  font-size: 22px;
+  line-height: 1;
+  pointer-events: none;
+}
+
+/* 运行指示点：窗口打开时显示 */
+.dock-dot {
+  position: absolute;
+  bottom: 4px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.5);
+  opacity: 0;
+  transition: opacity 160ms ease;
+}
+
+.dock-item.is-open .dock-dot { opacity: 1; }
+
+/* tooltip */
+.dock-label {
+  position: absolute;
+  bottom: 50px;
+  left: 50%;
+  transform: translateX(-50%) translateY(4px);
+  padding: 3px 8px;
+  border-radius: 6px;
+  background: rgba(20, 20, 26, 0.9);
+  color: #f2f2f7;
+  font-size: 11px;
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 140ms ease, transform 140ms ease;
+}
+
+.dock-item:hover .dock-label {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+
+/* ==================== Calculator ==================== */
+.calc-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: #2b2b30;
+  padding: 10px;
+  gap: 8px;
+}
+
+.calc-display {
+  flex: 0 0 auto;
+  min-height: 54px;
+  padding: 6px 10px;
+  text-align: right;
+  font-size: 34px;
+  font-weight: 300;
+  font-variant-numeric: tabular-nums;
+  color: #fff;
+  background: #1c1c1f;
+  border-radius: 8px;
+  overflow: hidden;
+  white-space: nowrap;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+}
+
+.calc-keys {
+  flex: 1;
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  grid-auto-rows: 1fr;
+  gap: 7px;
+  min-height: 0;
+}
+
+.key {
+  margin: 0;
+  padding: 0;
+  border: none;
+  border-radius: 8px;
+  font-size: 17px;
+  font-family: inherit;
+  font-weight: 500;
+  color: #fff;
+  background: #4a4a52;
+  cursor: pointer;
+  transition: filter 100ms ease, transform 80ms ease;
+}
+
+.key:hover { filter: brightness(1.18); }
+.key:active { transform: scale(0.96); filter: brightness(0.92); }
+
+.key.fn { background: #6c6c74; font-size: 15px; }
+.key.op { background: #ff9f0a; }
+.key.zero { grid-column: span 2; }
+
+
+/* ==================== 菜单栏 ====================
+   像素风 + 半透明，和 Dock 一致。它在 canvas 外面，
+   所以两条「系统栏」都不参与 genie 形变 —— 这正是 macOS 的行为。 */
+#menubar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 26px;
+  padding: 0 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+
+  background: rgba(255, 255, 255, 0.1);
+  backdrop-filter: blur(18px) saturate(160%);
+  -webkit-backdrop-filter: blur(18px) saturate(160%);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+  color: rgba(255, 255, 255, 0.92);
+  font-size: 11.5px;
+  letter-spacing: 0.01em;
+  z-index: 25;
+  user-select: none;
+}
+
+.mb-left,
+.mb-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.mb-logo {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #c9ced8, #8a93a3);
+  box-shadow: inset 0 0 2px rgba(255, 255, 255, 0.7);
+}
+
+.mb-app { font-weight: 600; }
+
+.mb-item { opacity: 0.72; }
+
+.mb-clock {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.85;
 }

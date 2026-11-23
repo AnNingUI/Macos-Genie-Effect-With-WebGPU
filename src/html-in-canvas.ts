@@ -210,27 +210,29 @@ export function onPaint(canvas: HTMLCanvasElement, handler: () => void): void {
  * ⚠️ 用 updateElementGeometry 时不要再写 element.style.transform —— 它同时
  * 负责视觉位置与命中测试。
  *
- * ⚠️ scale 是**等比**的（一个标量作用到 x/y 两轴）。可见区域宽高比与原元素
- * 不同时，单靠 scale 无法同时匹配宽高；若确实需要，可另加 canvasClip
- * （它"在 canvasTransform 的坐标空间内求值"，即 canvas 坐标）。
- * 这里只做等比缩放 —— 动画期间元素本就不可交互，精度需求集中在首尾两端。
+ * ⚠️ 传给这里的宽高是「可见包围盒」的尺寸：动画中它是一条被裁掉上沿的矩形，
+ * 所以命中区是包围盒而不是真正的梯形 —— 动画期间元素本就不可交互，
+ * 精度需求集中在首尾两端（0 时精确等于窗口，1 时完全移出画面）。
  */
 export function syncElementGeometry(
   canvas: HTMLCanvasElement,
   element: HTMLElement,
   cssX: number,
   cssY: number,
-  scale = 1,
+  cssWidth: number,
+  cssHeight: number,
 ): 'updateElementGeometry' | 'transform' {
   const el = canvasExtras(canvas);
+  const scaleX = cssWidth / Math.max(1, element.offsetWidth);
+  const scaleY = cssHeight / Math.max(1, element.offsetHeight);
 
   if (typeof el.updateElementGeometry === 'function') {
     el.updateElementGeometry(element, {
-      canvasTransform: new DOMMatrix().translate(cssX, cssY).scale(scale, scale),
+      canvasTransform: new DOMMatrix().translate(cssX, cssY).scale(scaleX, scaleY),
     });
     return 'updateElementGeometry';
   }
 
-  element.style.transform = `translate(${cssX}px, ${cssY}px) scale(${scale})`;
+  element.style.transform = `translate(${cssX}px, ${cssY}px) scale(${scaleX}, ${scaleY})`;
   return 'transform';
 }

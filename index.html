@@ -5,23 +5,28 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>WebGPU macOS Genie Effect · HTML-in-Canvas</title>
+  <!-- 内联 SVG favicon：避免浏览器请求 /favicon.ico 报 404 -->
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2316213e'/%3E%3Cpath d='M5 6h22l-7.5 21h-7z' fill='%23f5f5f7'/%3E%3C/svg%3E" />
 </head>
 
 <body>
   <div id="stage">
     <!--
       content="drawable" 让 canvas 的子元素参与布局，并可被捕获成纹理。
-      内部的 #genie-window 是**真实 HTML**（不再是 canvas2d 手绘的假窗口）：
-      可点、可输入、可用键盘、对屏幕阅读器可见。
+      内部的两个窗口都是**真实 HTML**：可点、可输入、可用键盘、对屏幕阅读器可见。
       Genie 变形完全由 WebGPU shader 负责，与 DOM 内容解耦。
+
+      注意：Dock 放在 canvas **外面**（#stage 的子元素），
+      否则它会被一起捕获进窗口纹理。
     -->
     <canvas id="webgpu-canvas" content="drawable" width="800" height="600">
-      <div id="genie-window" drawable>
-        <div class="titlebar">
+      <!-- ==================== Notes ==================== -->
+      <div id="genie-window" class="app-window" data-app="notes" drawable>
+        <div class="titlebar" data-drag>
           <div class="lights">
-            <span class="light close"></span>
-            <span class="light min"></span>
-            <span class="light max"></span>
+            <button class="light close" data-action="close" title="关闭" aria-label="关闭"></button>
+            <button class="light min" data-action="minimize" title="最小化" aria-label="最小化"></button>
+            <button class="light max" data-action="maximize" title="最大化" aria-label="最大化"></button>
           </div>
           <div class="title">Notes — 今日待办</div>
           <div class="titlebar-right"></div>
@@ -50,22 +55,106 @@
               <input id="new-todo" type="text" placeholder="输入后按 Enter…" />
             </label>
 
-            <div class="hint" id="hint">这个窗口是真的 DOM —— 试试点复选框、输入文字。</div>
+            <div class="hint" id="hint">拖标题栏移动窗口，拖右下角缩放；点黄色按钮收进 Dock。</div>
           </main>
         </div>
+        <div class="resize-grip" data-resize aria-hidden="true"></div>
+      </div>
+
+      <!-- ==================== Calculator ==================== -->
+      <div id="calc-window" class="app-window" data-app="calc" drawable>
+        <div class="titlebar" data-drag>
+          <div class="lights">
+            <button class="light close" data-action="close" title="关闭" aria-label="关闭"></button>
+            <button class="light min" data-action="minimize" title="最小化" aria-label="最小化"></button>
+            <button class="light max" data-action="maximize" title="最大化" aria-label="最大化"></button>
+          </div>
+          <div class="title">Calculator</div>
+          <div class="titlebar-right"></div>
+        </div>
+        <div class="calc-body">
+          <div class="calc-display" id="calc-display">0</div>
+          <div class="calc-keys">
+            <button class="key fn" data-key="AC">AC</button>
+            <button class="key fn" data-key="+/-">±</button>
+            <button class="key fn" data-key="%">%</button>
+            <button class="key op" data-key="/">÷</button>
+            <button class="key" data-key="7">7</button>
+            <button class="key" data-key="8">8</button>
+            <button class="key" data-key="9">9</button>
+            <button class="key op" data-key="*">×</button>
+            <button class="key" data-key="4">4</button>
+            <button class="key" data-key="5">5</button>
+            <button class="key" data-key="6">6</button>
+            <button class="key op" data-key="-">−</button>
+            <button class="key" data-key="1">1</button>
+            <button class="key" data-key="2">2</button>
+            <button class="key" data-key="3">3</button>
+            <button class="key op" data-key="+">+</button>
+            <button class="key zero" data-key="0">0</button>
+            <button class="key" data-key=".">.</button>
+            <button class="key op" data-key="=">=</button>
+          </div>
+        </div>
+        <div class="resize-grip" data-resize aria-hidden="true"></div>
       </div>
     </canvas>
+
+    <!-- 菜单栏：在 canvas 外面，不会被捕获进纹理。
+         macOS 里它始终可见，所以「全屏」窗口也不会盖住它。 -->
+    <div id="menubar">
+      <div class="mb-left">
+        <span class="mb-logo" aria-hidden="true"></span>
+        <span class="mb-app" id="mb-app">Notes</span>
+      </div>
+      <div class="mb-right">
+        <span class="mb-item">100%</span>
+        <span class="mb-item">⋯</span>
+        <span class="mb-clock" id="mb-clock">00:00</span>
+      </div>
+    </div>
+
+    <!-- Dock：在 canvas 外面，不会被捕获进纹理 -->
+    <div id="dock" role="toolbar" aria-label="Dock">
+      <button class="dock-item" data-dock="notes" title="Notes">
+        <span class="dock-glyph" aria-hidden="true">📝</span>
+        <span class="dock-dot" aria-hidden="true"></span>
+        <span class="dock-label">Notes</span>
+      </button>
+      <button class="dock-item" data-dock="calc" title="Calculator">
+        <span class="dock-glyph" aria-hidden="true">🧮</span>
+        <span class="dock-dot" aria-hidden="true"></span>
+        <span class="dock-label">Calculator</span>
+      </button>
+    </div>
   </div>
 
   <div id="controls">
-    <button id="genie-btn">Start Genie Effect</button>
+    <button id="genie-btn">最小化（Genie）</button>
     <button id="reset-btn">Reset</button>
     <label id="dir-wrap">
-      收缩方向
-      <select id="dir-select"></select>
+      Dock 位置
+      <select id="dock-edge-select"></select>
+    </label>
+    <label id="window-wrap">
+      布局
+      <select id="window-select">
+        <option value="full">全屏（贴满画布）</option>
+        <option value="windowed">非全屏（居中）</option>
+        <option value="offset">非全屏（偏左上）</option>
+      </select>
+    </label>
+    <label id="target-wrap">
+      <input id="target-input" type="checkbox" />
+      贴边目标
+    </label>
+    <label id="progress-wrap">
+      进度
+      <input id="progress-range" type="range" min="0" max="1" step="0.001" value="0" />
+      <output id="progress-value">0.00</output>
     </label>
   </div>
-  <div id="info">Click 'Start Genie Effect' to animate the window.</div>
+  <div id="info">点标题栏拖动窗口，点红/黄/绿三个交通灯试试。</div>
 
   <div id="unsupported" hidden>
     <h2>需要支持 HTML-in-Canvas 的浏览器</h2>

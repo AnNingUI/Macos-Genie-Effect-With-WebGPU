@@ -7,8 +7,12 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
+# 依赖安装产物：本项目固定用 pnpm，其它包管理器的锁文件不纳入版本库
 node_modules
 dist
+shots
+package-lock.json
+yarn.lock
 dist-ssr
 *.local
 

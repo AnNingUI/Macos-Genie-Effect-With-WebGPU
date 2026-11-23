@@ -1,78 +1,129 @@
-// Genie 片元着色器 —— 完全沿用最初版的形变数学，仅做坐标泛化。
+// Genie 片元着色器：把 K.md 的网格形变写成逐像素**逆映射**。
 //
-// 最初版的公式（一字未改）：
-//   left_curve_x  = A·sin(π·y - π/2) + D    （D = A = left_max/2）
-//   right_curve_x = A·sin(π·y + π/2) + D    （D = (right_min+1)/2, A = 1-D）
-//   left_max  = curve_progress · left_max_end
-//   right_min = 1 - curve_progress · (1 - right_min_end)
-//   transformed_uv_x = (uv.x - left_curve_x) / (right_curve_x - left_curve_x)
-//   transformed_uv_y = uv.y - translation_progress
-//   越界的像素 discard
+// 正向模型（K.md / SKWarpGeometryGrid，1 列 × N 行）：
+//   对每一行 along = a，两侧边距是
+//     lo(a) = mix( mix(fromPLo, toPLo, slide), fromPLo, ease(t) )
+//     hi(a) = mix( mix(fromPHi, toPHi, slide), fromPHi, ease(t) )
+//   其中 t = (a - toALo) / (fromALo - toALo) 是「离目标远近」的归一化值。
 //
-// 泛化只有三处，都不改公式本身：
-//   1. 输入 UV 由「整块画布」改为「窗口矩形」——顶点着色器已把 uv 设为窗口内 0..1
-//   2. left_max_end / right_min_end 由目标宽度推导，不再写死
-//   3. 位移终点由 targetX/targetY 给出，不再固定往画布底边
+// 片元要回答的是反问题：屏幕上这个像素该采样源纹理的哪个点？
+//   1. 把 canvasPx 投影到 (dir, perp) 局部坐标系，得到 (a, c)
+//   2. 若 a 落在当前带 [bandLo, bandHi] 之外 → discard
+//   3. 由 a 反解 t，再算该行的 lo(a) / hi(a)
+//   4. 若 c 落在 [lo, hi] 之外 → discard（漏斗外）
+//   5. across / along 归一化后回查源矩形，得到纹理坐标
 //
-// ⚠️ Params 结构体与 `p` 绑定声明在 Genie.vertex.wgsl（同 module 不能重复声明）。
+// 关键：内容是被**压缩**进逐渐变短的带子里的（K.md 网格形变的本质），
+// 不再是旧实现的「整块下滑 + 裁掉顶部」。
+//
+// ⚠️ Params 结构体与 p 绑定声明在 Genie.vertex.wgsl（同 module 不能重复声明）。
+// ⚠️ 局部变量不要用 time / target / sample 等名字：前两个是保留字，
+//    后者会与 textureSample 的内置函数名混淆。
+//
+// timing.x = 当前时间（秒）
+// timing.y = 曲线阶段时长（秒）
+// timing.z = 位移阶段开始时刻（秒）
+// timing.w = 位移阶段时长（秒）
 
 @group(0) @binding(1) var t : texture_2d<f32>;
 @group(0) @binding(2) var s : sampler;
 
 struct FSIn {
-  @location(0) uv : vec2f,
+  @location(0) canvasPx : vec2f,
 };
+
+// 二次缓入缓出，与 src/genie.ts 的 easeInOutQuad 逐字对应
+fn easeInOutQuad(x : f32) -> f32 {
+  let c = clamp(x, 0.0, 1.0);
+  if (c < 0.5) {
+    return 2.0 * c * c;
+  }
+  return 1.0 - pow(-2.0 * c + 2.0, 2.0) * 0.5;
+}
 
 @fragment
 fn main_fragment(input : FSIn) -> @location(0) vec4f {
-  let pi = 3.14159265359;
+  let dir = p.dir.xy;
+  let perp = p.dir.zw;
 
-  // 1. 动画进度
-  let total_curve = p.curveDuration;
-  let total_translation = p.translationDuration;
-  let total_animation = total_curve + total_translation;
-  let clamped_time = clamp(p.time, 0.0, total_animation);
+  let totalCurve = max(p.timing.y, 1e-5);
+  let transStart = p.timing.z;
+  let totalTrans = max(p.timing.w, 1e-5);
 
-  // 2. 曲线阶段（上边收窄）
-  let curve_progress = clamp(clamped_time / total_curve, 0.0, 1.0);
+  let now = max(p.timing.x, 0.0);
+  let slide = clamp(now / totalCurve, 0.0, 1.0);
+  let trans = clamp((now - transStart) / totalTrans, 0.0, 1.0);
 
-  // left_max_end / right_min_end 由 draw() 按目标宽度算好传入
-  let left_max_end = (1.0 - p.targetWidth / max(p.rect.z, 1.0)) * 0.5;
-  let right_min_end = 1.0 - left_max_end;
+  // ---- 源 / 目标在局部坐标系下的投影 ----
+  let fromC = p.rect.xy + p.rect.zw * 0.5;
+  let toC = p.targetRect.xy + p.targetRect.zw * 0.5;
 
-  let left_max = curve_progress * left_max_end;
-  let right_min = 1.0 - curve_progress * (1.0 - right_min_end);
+  let fromHalfA = abs(dir.x) * p.rect.z * 0.5 + abs(dir.y) * p.rect.w * 0.5;
+  let toHalfA = abs(dir.x) * p.targetRect.z * 0.5 + abs(dir.y) * p.targetRect.w * 0.5;
+  let fromHalfP = abs(perp.x) * p.rect.z * 0.5 + abs(perp.y) * p.rect.w * 0.5;
+  let toHalfP = abs(perp.x) * p.targetRect.z * 0.5 + abs(perp.y) * p.targetRect.w * 0.5;
 
-  let left_D = left_max / 2.0;
-  let left_A = left_D;
-  let left_curve_x = left_A * sin(pi * input.uv.y - pi * 0.5) + left_D;
+  let fromA = dot(fromC, dir);
+  let toA = dot(toC, dir);
+  let fromP = dot(fromC, perp);
+  let toP = dot(toC, perp);
 
-  let right_D = (right_min + 1.0) / 2.0;
-  let right_A = 1.0 - right_D;
-  let right_curve_x = right_A * sin(pi * input.uv.y + pi * 0.5) + right_D;
+  let fromALo = fromA - fromHalfA;
+  let fromAHi = fromA + fromHalfA;
+  let toALo = toA - toHalfA;
+  let toAHi = toA + toHalfA;
+  let fromPLo = fromP - fromHalfP;
+  let fromPHi = fromP + fromHalfP;
+  let toPLo = toP - toHalfP;
+  let toPHi = toP + toHalfP;
 
-  // 3. 位移阶段
-  var translation_progress = 0.0;
-  if (clamped_time > total_curve) {
-    translation_progress = clamp((clamped_time - total_curve) / total_translation, 0.0, 1.0);
-  }
+  // ---- 当前帧的行进带 ----
+  // 两端分别朝各自的目标端插值 —— 带子单调收缩，终点精确落在目标跨度上。
+  let farA = fromALo + trans * (toALo - fromALo);
+  let nearA = fromAHi + trans * (toAHi - fromAHi);
+  let bandLo = min(farA, nearA);
+  let bandHi = max(farA, nearA);
 
-  // 4. 重映射 UV.x
-  var transformed_uv_x = input.uv.x;
-  if (right_curve_x > left_curve_x) {
-    transformed_uv_x = (input.uv.x - left_curve_x) / (right_curve_x - left_curve_x);
-  } else {
+  // ---- 当前像素落到局部坐标系 ----
+  let a = dot(input.canvasPx, dir);
+  let c = dot(input.canvasPx, perp);
+
+  if (a < bandLo || a > bandHi) {
     discard;
   }
 
-  let transformed_uv_y = input.uv.y - translation_progress;
-  let transformed_uv = vec2f(transformed_uv_x, transformed_uv_y);
+  // ---- 该行的两侧边距 ----
+  let span = fromALo - toALo;
+  var rowT = 1.0;
+  if (abs(span) > 1e-6) {
+    rowT = clamp((a - toALo) / span, 0.0, 1.0);
+  }
+  let e = easeInOutQuad(rowT);
 
-  // 5. 裁剪
-  if (input.uv.x < left_curve_x || input.uv.x > right_curve_x || transformed_uv_y < 0.0) {
+  let rowLo = mix(mix(fromPLo, toPLo, slide), fromPLo, e);
+  let rowHi = mix(mix(fromPHi, toPHi, slide), fromPHi, e);
+
+  if (rowHi - rowLo <= 1e-4) {
+    discard;
+  }
+  if (c < rowLo || c > rowHi) {
     discard;
   }
 
-  // 6. 采样
-  return textureSample(t, s, transformed_uv);
+  // ---- 归一化回源矩形 → 纹理坐标 ----
+  let acrossNorm = (c - rowLo) / (rowHi - rowLo);
+  let alongNorm = (a - bandLo) / max(bandHi - bandLo, 1e-6);
+
+  let srcAlong = fromALo + alongNorm * (fromAHi - fromALo);
+  let srcAcross = fromPLo + acrossNorm * (fromPHi - fromPLo);
+
+  // 换回画布坐标，再映射到纹理 UV
+  let srcPx = dir * srcAlong + perp * srcAcross;
+  let uv = (srcPx - p.rect.xy) / p.rect.zw;
+
+  if (uv.x < -0.002 || uv.x > 1.002 || uv.y < -0.002 || uv.y > 1.002) {
+    discard;
+  }
+
+  return textureSample(t, s, uv);
 }

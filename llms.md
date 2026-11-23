@@ -1,267 +1,177 @@
-# MacOS Genie Effect 实现原理详解：跨平台、跨 API 的通用实现方案
+# Genie Effect 实现原理
 
-> 参考: [细说如何完美实现 macOS 中的神奇效果](https://daniate.github.io/2021/07/27/%E7%BB%86%E8%AF%B4%E5%A6%82%E4%BD%95%E5%AE%8C%E7%BE%8E%E5%AE%9E%E7%8E%B0macOS%E4%B8%AD%E7%9A%84%E7%A5%9E%E5%A5%87%E6%95%88%E6%9E%9C/)
+> 参考：
+> - [细说如何完美实现 macOS 中的神奇效果](https://daniate.github.io/2021/07/27/%E7%BB%86%E8%AF%B4%E5%A6%82%E4%BD%95%E5%AE%8C%E7%BE%8E%E5%AE%9E%E7%8E%B0macOS%E4%B8%AD%E7%9A%84%E7%A5%9E%E5%A5%87%E6%95%88%E6%9E%9C/)
+> - K.md（mesh transform 与 SpriteKit 视角的综述）
+>
+> 本文只描述**本仓库实际实现**的部分。文末单列了未实现的内容。
 
-## 摘要
+## 1. 效果分解
 
-本文详细阐述了 MacOS Genie Effect 的数学原理和实现方法，提供了一套完整的、与平台无关的实现方案。通过深入解析 WebGPU 中的 WGSL 实现，本文将帮助任何 AI 模型或开发者在任意图形 API（包括 WebGPU、OpenGL、DirectX、Metal 等）和环境中复现这一经典动画效果。
+macOS 的窗口最小化大致分两步：
 
-## 1. 引言
+1. **曲线阶段**：窗口两侧向内收，形成漏斗。
+2. **位移阶段**：整条内容被压缩着流向图标，最终落成图标大小。
 
-MacOS Genie Effect 是苹果操作系统中一个标志性的窗口最小化动画效果，窗口在最小化时会像被"吸入"Dock 一样进行变形收缩。该效果因其流畅自然的动画而广受赞誉。本文将从数学原理出发，深入解析该效果的实现细节，提供一套可跨平台、跨 API 复现的通用方案。
+本项目把真实 DOM 快照成纹理，然后在一个覆盖「源 ∪ 目标」的四边形上逐像素逆向映射 UV
+—— 曲线因此是逐像素精确的，不需要细分网格。
 
-## 2. 实现原理概述
+方向可以是**八个方向中的任意一个**，目标矩形决定往哪收、收到哪里。
 
-Genie Effect 的实现可以分解为两个关键阶段：
+## 2. 坐标系
 
-1. **水平变形（曲线收缩）**：窗口顶部逐渐变窄，形成曲线形状
-2. **垂直移动（向下收缩）**：窗口内容向目标位置移动并收缩
+| 概念 | 单位 | 说明 |
+|---|---|---|
+| CSS 像素 | CSS px | 布局与 `updateElementGeometry` 使用 |
+| 物理像素 | device px | canvas 后备缓冲、uniform、shader 使用 |
+| UV | 0..1 | 窗口内归一化，原点左上，y 向下 |
 
-这两个动画阶段在时间上略有重叠，创造出流畅自然的视觉效果。
-
-## 3. 数学原理详解
-
-### 3.1 曲线变形原理
-
-曲线变形通过正弦函数实现，对于窗口的每一行（垂直位置 y），计算该行左侧和右侧的新边界位置。
-
-#### 左侧曲线函数：
-
-```
-x_left = A * sin(π * y - π/2) + D
-```
-
-#### 右侧曲线函数：
-
-```
-x_right = A * sin(π * y + π/2) + D
-```
-
-其中：
-
-- `A` 是振幅参数，控制曲线的弯曲程度
-- `D` 是偏移参数，控制曲线的中心位置
-- `y` 是当前像素的垂直归一化坐标 (0.0-1.0)
-
-### 3.2 参数计算
-
-在动画过程中，参数 A 和 D 需要根据动画进度动态计算：
-
-#### 左侧曲线参数：
-
-```
-left_D = left_max / 2.0
-left_A = left_D
-```
-
-#### 右侧曲线参数：
-
-```
-right_D = (right_min + 1.0) / 2.0
-right_A = 1.0 - right_D
-```
-
-其中 `left_max` 和 `right_min` 是根据动画进度插值得到的参数。
-
-### 3.3 垂直移动原理
-
-垂直移动通过简单地将纹理坐标向上偏移实现：
-
-```
-y_transformed = y_original - translation_progress
-```
-
-## 4. 核心实现代码解析
-
-### 4.1 顶点着色器实现
-
-顶点着色器的主要任务是将顶点坐标从像素坐标转换为标准化设备坐标(NDC)：
+转换只有一处：`renderScale.dpr = devicePixelRatio`，`toPx(v) = v * dpr`。
+顶点着色器把物理像素转成 NDC：
 
 ```wgsl
-struct VertexInput {
-    @location(0) position : vec2<f32>,
-    @location(1) uv : vec2<f32>,
-};
-
-struct VertexOutput {
-    @builtin(position) position : vec4<f32>,
-    @location(0) uv : vec2<f32>,
-};
-
-struct CanvasDimensions {
-    width : f32,
-    height : f32,
-};
-
-@group(1) @binding(0) var<uniform> canvas_dims : CanvasDimensions;
-
-@vertex
-fn main_vertex(input: VertexInput) -> VertexOutput {
-    var output : VertexOutput;
-    // Convert from pixel coordinates (0-width, 0-height) to NDC (-1 to 1)
-    let x_ndc = (input.position.x / canvas_dims.width) * 2.0 - 1.0;
-    let y_ndc = 1.0 - (input.position.y / canvas_dims.height) * 2.0; // Flip Y
-    output.position = vec4<f32>(x_ndc, y_ndc, 0.0, 1.0);
-    output.uv = input.uv;
-    return output;
-}
+xNdc = (px / viewport.x) * 2.0 - 1.0;
+yNdc = 1.0 - (py / viewport.y) * 2.0;   // y 向下 → 翻转
 ```
 
-### 4.2 片段着色器实现
+## 3. 局部坐标系与曲线公式
 
-片段着色器包含了 Genie Effect 的核心实现逻辑：
+行进方向是单位向量 `dir`，垂直方向 `perp = (-dir.y, dir.x)`。所有几何都在
+`(along, across)` 里算：`a = dot(p, dir)`、`c = dot(p, perp)`。
+
+### 关键：行进轴只有 4 个
+
+`dir` 的取值只有 上 / 下 / 左 / 右 四个。斜向方向（`downLeft` 等）映射到最近的
+主轴，**不旋转坐标系**：
+
+```
+downLeft  → dir = (0, 1)    // 同 down，只是目标 x 在左边
+downRight → dir = (0, 1)    // 同 down，只是目标 x 在右边
+upLeft    → dir = (0, -1)   // 同 up
+```
+
+真实 macOS 里漏斗永远沿屏幕的一条主轴收窄 —— 图标在角落不代表窗口斜着旋转。
+如果把 `dir` 设成 45°，整块窗口会绕对角线扭曲，那是错的。
+
+因此**目标位置与行进轴完全解耦**：目标可以落在任意位置（`targetRect`），
+为「Dock 有任意多个图标」留余地，不限于八宫格的 8 个点。
+
+源 / 目标矩形投影到这两个轴上，各得两个区间：`fromALo..fromAHi`、`toALo..toAHi`、
+`fromPLo..fromPHi`、`toPLo..toPHi`。
+
+### 坐标系基准是画布（屏幕），不是窗口
+
+窗口可以非全屏（比画布小），此时**目标仍贴画布边缘** —— 因为 Dock 在屏幕边上，
+与窗口大小无关。窗口与画布的相对关系由 `layoutWindow()` 按 `windowMode` 决定，
+`genie.ts` 只关心「源矩形」和「目标矩形」两个绝对矩形，不关心窗口是否全屏。
+
+### 行进带（位移阶段）
+
+两端分别朝各自的目标端插值：
+
+```
+farA  = fromALo + trans · (toALo - fromALo)
+nearA = fromAHi + trans · (toAHi - fromAHi)
+bandLo = min(farA, nearA)   bandHi = max(farA, nearA)
+```
+
+K.md 用的是「共享 translation + 近端 clamp」，在 from / to 的端点重合时与这里等价；
+两端各自插值对一般情况都成立，且 `trans = 0` 时不会误夹。
+
+### 每行的两侧边距（曲线阶段）
+
+```
+e  = easeInOutQuad((a - toALo) / (fromALo - toALo))     // 0=靠目标, 1=远离目标
+e  = e < 0.5 ? 2e² : 1 - (-2e+2)²/2
+
+lo = mix( mix(fromPLo, toPLo, slide), fromPLo, e )
+hi = mix( mix(fromPHi, toPHi, slide), fromPHi, e )
+```
+
+两个 `mix` 的嵌套是关键：内层按 `slide` 把两侧向目标收拢，外层按 `e` 把**远离目标**
+的那一端拉回原位置 —— 于是靠近目标的一端已经收窄、远离目标的一端保持满宽，
+轮廓就是漏斗。
+
+## 4. 进度参数
+
+```
+slide = clamp(t / curveDuration, 0, 1)              // 曲线阶段：0 → 0.5
+trans = clamp((t - transStart) / transDuration, 0, 1) // 位移阶段：0.4 → 1
+```
+
+`curvePortion = 0.5`、`translationStart = 0.4`（都是总时长的比例）。
+**两段在 0.4 ~ 0.5 重叠 0.1**，这是 K.md 里「液体流过漏斗」连贯感的来源；
+旧实现是严格串行（曲线跑完才位移），比现在生硬。
+
+## 5. 压缩而非裁剪
+
+这是与旧实现最本质的差异。片元把屏幕像素映射回源矩形：
 
 ```wgsl
-struct FragmentInput {
-    @location(0) uv : vec2<f32>,
-};
-
-struct Uniforms {
-    time : f32,
-    curve_duration : f32,
-    translation_duration : f32,
-    left_max_end : f32,
-    right_min_end : f32,
-    target_x : f32,
-    target_width : f32,
-};
-
-@group(0) @binding(0) var<uniform> uniforms : Uniforms;
-@group(0) @binding(1) var t : texture_2d<f32>;
-@group(0) @binding(2) var s : sampler;
-
-@fragment
-fn main_fragment(input: FragmentInput) -> @location(0) vec4<f32> {
-    let pi = 3.14159265359;
-
-    // 计算动画总时长
-    let total_curve_duration = uniforms.curve_duration;
-    let total_translation_duration = uniforms.translation_duration;
-    let total_animation_duration = total_curve_duration + total_translation_duration;
-
-    // 限制时间在动画范围内
-    let clamped_time = clamp(uniforms.time, 0.0, total_animation_duration);
-
-    // 1. 顶部收缩动画（曲线变形）
-    let curve_progress = clamp(clamped_time / total_curve_duration, 0.0, 1.0);
-
-    // 计算当前曲线参数
-    let left_max = curve_progress * uniforms.left_max_end;
-    let right_min = 1.0 - curve_progress * (1.0 - uniforms.right_min_end);
-
-    // 左侧曲线参数计算
-    let left_D = left_max / 2.0;
-    let left_A = left_D;
-    let left_curve_x = left_A * sin(pi * input.uv.y - pi * 0.5) + left_D;
-
-    // 右侧曲线参数计算
-    let right_D = (right_min + 1.0) / 2.0;
-    let right_A = 1.0 - right_D;
-    let right_curve_x = right_A * sin(pi * input.uv.y + pi * 0.5) + right_D;
-
-    // 2. 垂直移动动画
-    var translation_progress = 0.0;
-    if (clamped_time > total_curve_duration) {
-        translation_progress = clamp((clamped_time - total_curve_duration) / total_translation_duration, 0.0, 1.0);
-    }
-
-    // 3. 应用变换到UV坐标
-    var transformed_uv_x = input.uv.x;
-    if (right_curve_x > left_curve_x) {
-        transformed_uv_x = (input.uv.x - left_curve_x) / (right_curve_x - left_curve_x);
-    } else {
-        // 曲线交叉时丢弃像素
-        discard;
-    }
-
-    // 应用垂直变换
-    let transformed_uv_y = input.uv.y - translation_progress;
-    let transformed_uv = vec2<f32>(transformed_uv_x, transformed_uv_y);
-
-    // 4. 丢弃屏幕外的像素
-    if (input.uv.x < left_curve_x || input.uv.x > right_curve_x || transformed_uv_y < 0.0) {
-        discard;
-    }
-
-    // 5. 采样纹理
-    return textureSample(t, s, transformed_uv);
-}
+acrossNorm = (c - rowLo) / (rowHi - rowLo)
+alongNorm  = (a - bandLo) / (bandHi - bandLo)
+srcAlong   = fromALo + alongNorm * (fromAHi - fromALo)
+srcAcross  = fromPLo + acrossNorm * (fromPHi - fromPLo)
+srcPx      = dir * srcAlong + perp * srcAcross
+uv         = (srcPx - rect.xy) / rect.zw
 ```
 
-## 5. 跨平台移植指南
+因为 `alongNorm` 是**归一化到当前带**的，带宽变短时整条内容被压进去，
+而不是被裁掉。于是：
 
-要将此实现在其他图形 API（如 OpenGL、DirectX、Metal 等）中重现，请遵循以下步骤：
+- 进度 1 时可见区域 = 目标矩形（Dock 图标大小），**窗口仍然可见**
+- 旧实现是 `uv.y' = uv.y - tp` + discard，进度 1 时高度为 0，窗口完全消失
 
-### 5.1 顶点着色器移植
+超出源矩形 UV 的像素（浮点误差导致）仍然 `discard`，阈值放宽到 ±0.002。
 
-1. 将像素坐标转换为对应 API 的顶点坐标系统
-2. 传递 UV 坐标到片段着色器
+## 6. uniform 布局
 
-### 5.2 片段着色器移植
-
-1. 实现相同的正弦曲线计算逻辑
-2. 使用对应 API 的纹理采样函数
-3. 正确处理像素丢弃操作（在某些 API 中可能需要其他方式实现）
-
-### 5.3 参数传递
-
-1. 将 uniform 参数传递给着色器（时间、持续时间、目标位置等）
-2. 传递纹理和采样器对象
-
-### 5.4 数学函数
-
-1. 确保使用相同的数学函数（sin、clamp 等）
-2. 保持 π 值的一致性（建议使用 3.14159265359）
-
-## 6. 动画参数说明
-
-- `time`：当前动画时间（秒）
-- `curve_duration`：曲线变形动画持续时间
-- `translation_duration`：垂直移动动画持续时间
-- `left_max_end`：左侧曲线最终收缩位置
-- `right_min_end`：右侧曲线最终收缩位置
-- `target_x`：目标位置 X 坐标
-- `target_width`：目标宽度
-
-## 7. 实现细节和优化建议
-
-### 7.1 时间控制
-
-动画分为两个阶段：
-
-1. 曲线变形阶段（先开始）
-2. 垂直移动阶段（稍后开始）
-
-两个阶段有部分重叠以获得更自然的效果。
-
-### 7.2 边界处理
-
-当左右曲线相交或交叉时，应丢弃像素以避免视觉异常：
-
-```wgsl
-if (right_curve_x > left_curve_x) {
-    // 正常处理
-} else {
-    discard;
-}
+```
+float index   field
+[0..1]        viewport               画布后备缓冲（物理像素）
+[2..3]        _pad0                  对齐填充
+[4..7]        rect                   源窗口矩形 x, y, w, h
+[8..11]       targetRect             目标矩形（Dock 图标位置与尺寸）
+[12..15]      quad                   绘制四边形 = 源 ∪ 目标（外扩 2px）
+[16..19]      timing                 time, curveDuration, translationStart, translationDuration
+[20..23]      dir                    行进方向 xy + 垂直方向 xy
 ```
 
-### 7.3 坐标系统一致性
+共 96 字节，CPU 侧由 `packGenieUniforms` 写入，测试脚本逐字段核对。
 
-确保所有坐标系统的一致性：
+⚠️ `target` 与 `time` 是 **WGSL 保留字**，不能做结构体成员名（编译直接报错），
+所以目标叫 `targetRect`、时间放在 `timing.x`。
 
-- UV 坐标范围：[0.0, 1.0]
-- 屏幕坐标转换正确处理
-- Y 轴方向在不同 API 中可能需要翻转
+## 7. 时间线
 
-## 8. 总结
+`animationDuration = 1.0s`，`curvePortion = 0.5`，`translationStart = 0.4`：
 
-通过使用正弦函数和时间参数，我们可以创建出流畅自然的 Genie Effect 动画。该实现的核心在于：
+| t (s) | slide | trans | 视觉 |
+|---|---|---|---|
+| 0.000 | 0.00 | 0.00 | 原窗口 |
+| 0.200 | 0.40 | 0.00 | 漏斗开始成形 |
+| 0.400 | 0.80 | 0.00 | 收窄近尾声；**位移从此刻起跑** |
+| 0.500 | 1.00 | 0.17 | 收窄完成，带子开始变短（重叠区结束） |
+| 0.700 | 1.00 | 0.50 | 内容压到一半，整体流向图标 |
+| 1.000 | 1.00 | 1.00 | 落成 Dock 图标大小，**仍在屏幕上** |
 
-1. 使用正弦函数创建自然的曲线变形
-2. 分阶段处理动画，使效果更加流畅
-3. 正确处理纹理坐标变换和像素丢弃
+## 8. 移植到其它图形 API
 
-这种实现方式不仅适用于 WebGPU，也可以轻松移植到其他图形 API 中。通过调整参数，可以创建出不同风格的 Genie Effect，满足各种设计需求。
+需要移植的只有三件事：顶点变换、片元里的 UV 重映射、uniform 参数。注意差异：
 
-本文提供了一套完整的、与平台无关的实现方案，任何 AI 模型或开发者都可以基于此方案在任意支持着色器的平台和环境中复现 MacOS Genie Effect 效果。
+- **NDC 的 y 方向**：WebGPU / Metal / DirectX 的 NDC y 向上，需要翻转。
+- **纹理采样坐标系**：WebGPU / D3D / Metal 的 UV 原点在左上，OpenGL 在左下，需要翻转。
+- **discard 的等价物**：GLSL / HLSL / MSL 都有 `discard`，行为一致。
+- **uniform 对齐**：WGSL 的 `vec4f` 需 16 字节对齐；GLSL 的 `std140` 对 `vec2` 的填充规则不同，
+  移植时必须重新核对偏移。
+
+## 9. 未实现的部分
+
+以下内容**不在**当前代码里，写在这里是为了避免误以为已经落地：
+
+1. **与真实 Dock 联动**：演示里目标按方向贴边；勾「非对称目标」可模拟任意落点，
+   但不会去读系统 Dock 的位置。
+2. **反向动画**：只做最小化方向，没有「从图标还原」的那一套。
+3. **CPU 侧网格顶点数组**：`genie.ts` 只推导参数，形变全部在片元里完成；
+   仓库里不存在 `computeGenieMesh` / `createGridTemplate` 之类的接口。
+
