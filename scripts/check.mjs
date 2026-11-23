@@ -265,13 +265,16 @@ try {
     const app = window.__app;
     const w = app.windows[0];
     const t0 = performance.now();
-    while (!app.animating.has(w) && performance.now() - t0 < 1500) {
-      await new Promise(r => setTimeout(r, 15));
-    }
-    while (app.animating.has(w) && performance.now() - t0 < 6000) {
+    // 直接等 playhead 归零（而不是等 animating 集合）：
+    // restoreWindow 是点完才把窗口加进 animating，轮询该集合有竞态。
+    while (w.state.playhead > 0.001 && performance.now() - t0 < 6000) {
       await new Promise(r => setTimeout(r, 25));
     }
-    return JSON.stringify({ playhead: w.state.playhead, minimized: w.state.minimized });
+    return JSON.stringify({
+      playhead: w.state.playhead,
+      minimized: w.state.minimized,
+      stillAnimating: app.animating.has(w),
+    });
   })()`);
   if (restored.playhead > 0.001) failures.push('Dock 还原没有回到 playhead=0: ' + restored.playhead);
   if (restored.minimized) failures.push('Dock 还原后仍是 minimized');
@@ -329,6 +332,28 @@ try {
   if (arith.divZero !== 'Error') failures.push('除零应显示 Error，实际 ' + arith.divZero);
   console.log('=== 回归：计算器 ===');
   console.log(JSON.stringify(arith));
+  // ⑩ 画面清晰度：纹理尺寸必须精确等于 元素尺寸 × DPR（差 1px 就会整体重采样）
+  const crisp = await json(`JSON.stringify((() => {
+    const app = window.__app;
+    const dpr = window.devicePixelRatio;
+    return app.windows.map(w => {
+      const cssW = w.el.getBoundingClientRect().width;
+      return {
+        name: w.name,
+        tex: w.texSize,
+        expect: { w: Math.round(cssW * dpr), h: Math.round(w.el.getBoundingClientRect().height * dpr) },
+      };
+    });
+  })())`);
+  for (const c of crisp) {
+    if (Math.abs(c.tex.width - c.expect.w) > 0 || Math.abs(c.tex.height - c.expect.h) > 0) {
+      failures.push(c.name + ' 纹理尺寸与元素×DPR 不精确相等（会造成整体重采样发虚）: tex=' +
+        JSON.stringify(c.tex) + ' expect=' + JSON.stringify(c.expect));
+    }
+  }
+  console.log('=== 回归：纹理尺寸精确性 ===');
+  console.log(JSON.stringify(crisp));
+
   // ⑨ 通过真实 UI 切换 Dock 到四条边：方向 / 目标 / visibleFrame 都要跟着变
   const edges = [];
   for (const edge of ['bottom', 'top', 'left', 'right']) {

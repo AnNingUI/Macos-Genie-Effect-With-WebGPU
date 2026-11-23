@@ -107,7 +107,11 @@ async function initWebGPU() {
   const canvas = canvasEl;
   const context = canvas.getContext("webgpu") as GPUCanvasContext;
   const canvasFormat = navigator.gpu.getPreferredCanvasFormat();
-  context.configure({ device, format: canvasFormat, alphaMode: "opaque" });
+  // ⚠️ 必须是 premultiplied，不能用 opaque。
+  // 窗口有 border-radius，圆角外侧的纹理像素 alpha = 0。
+  // opaque 会忽略 alpha，把那些像素的 RGB（= 0，黑）直接画出来 ——
+  // 结果每个窗口的四个角都挂着黑三角。
+  context.configure({ device, format: canvasFormat, alphaMode: "premultiplied" });
   return { device, context, canvasFormat, canvas };
 }
 
@@ -170,7 +174,28 @@ class GenieApp {
       vertex: { module, entryPoint: "main_vertex" },
       fragment: {
         module, entryPoint: "main_fragment",
-        targets: [{ format: this.canvasFormat }],
+        targets: [{
+          format: this.canvasFormat,
+          // ⚠️ 必须显式开混合：默认是"直接覆盖"，后画的四边形会把先画的整块盖掉，
+          // 包括它自己圆角外那些 a=0 的透明像素 —— 预乘后是 (0,0,0,0)，
+          // 覆盖上去就是黑色。这解释了"只有窗口叠在另一个窗口上时才有黑边"。
+         //
+          // premultiplied 源的标准 over 合成：
+          //   rgb = src.rgb + dst.rgb * (1 - src.a)
+          //   a   = src.a   + dst.a   * (1 - src.a)
+          blend: {
+            color: {
+              srcFactor: "one",
+              dstFactor: "one-minus-src-alpha",
+              operation: "add",
+            },
+            alpha: {
+              srcFactor: "one",
+              dstFactor: "one-minus-src-alpha",
+              operation: "add",
+            },
+          },
+        }],
       },
       primitive: { topology: "triangle-list" },
     });
@@ -920,6 +945,7 @@ class GenieApp {
       // 形变期间挂起指针事件：命中区只有包围盒精度，着色器又 discard 了漏斗外像素
       const interactive = w.state.playhead <= 0 && !w.state.minimized;
       w.el.style.pointerEvents = interactive ? "" : "none";
+
     }
 
     if (progressRange && this.activeWindow) {
@@ -933,7 +959,8 @@ class GenieApp {
     const pass = encoder.beginRenderPass({
       colorAttachments: [{
         view: this.context.getCurrentTexture().createView(),
-        clearValue: { r: 0.1, g: 0.12, b: 0.18, a: 1.0 },
+        // 透明清屏：canvas 只负责画窗口，背景交给页面的 #stage 渐变
+        clearValue: { r: 0, g: 0, b: 0, a: 0 },
         loadOp: "clear", storeOp: "store",
       }],
     });

@@ -1,11 +1,16 @@
 * { margin: 0; padding: 0; box-sizing: border-box; }
 
 body {
-  min-height: 100vh;
+  /* ⚠️ 清晰度要点（都是实测踩出来的）：
+     1. 不要 min-height: 100vh —— 721px 视口下会解析成 720.833。
+     2. 用 padding + flex 而不是绝对定位：绝对定位的 calc(50% - 400px)
+        在奇数视口宽下也会落半像素。
+     3. stage 用整数宽高，水平居中结果才能落整。 */
+  margin: 0;
   display: flex;
   flex-direction: column;
-  justify-content: center;
   align-items: center;
+  padding: 8px 0 0;
   background: #000;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   color: #fff;
@@ -14,12 +19,22 @@ body {
 
 #stage {
   position: relative;
+  flex: 0 0 auto;
   width: 800px;
   height: 600px;
   /* 用 outline 代替 border：border 会挤占内容盒，
      让 canvas 的实际 CSS 尺寸变成 796×596，与后备缓冲 800×600 不一致 → 拉伸模糊 */
   outline: 2px solid #444;
-  background: linear-gradient(to bottom, #1a1a2e, #16213e);
+  /* 桌面背景（模拟 macOS 壁纸）。
+     ⚠️ 窗口有 10px 圆角、圆角外侧是透明的，所以背景色会直接从四个角透出来。
+     用接近黑的深色时，浅色标题栏两端就挂着两块深色角，看起来像"窗口有黑边"。
+     实测把背景改成品红/黄，那两块角也跟着变成品红/黄 —— 证明 alpha 没问题，
+     纯粹是底色与窗口的对比度造成的观感。
+     这里用明亮的蓝紫渐变，圆角过渡才自然。 */
+  background:
+    radial-gradient(120% 90% at 15% 0%, #8ea2c4 0%, transparent 55%),
+    radial-gradient(110% 80% at 90% 100%, #a48bc4 0%, transparent 60%),
+    linear-gradient(160deg, #5b6b8c 0%, #74839f 50%, #8d93a8 100%);
   /* ⚠️ 不能 overflow: hidden —— Dock 要溢出到画布下方 */
   overflow: visible;
 }
@@ -65,7 +80,10 @@ body {
   color: #1d1d1f;
   font-size: 14px;
   -webkit-font-smoothing: antialiased;
-  box-shadow: 0 22px 60px rgba(0, 0, 0, 0.55);
+  /* ⚠️ 不要在这里加 box-shadow：元素是 canvas 的 drawable 子元素，
+     阴影会被 drawElementImageToTexture 一起捕获进纹理，
+     于是窗口四周（尤其圆角处）出现一圈深色描边，看起来像"黑边"。
+     阴影改由 canvas 外的 .window-shadow 元素承担（见 style.css 末尾）。 */
 
   /* 允许接收指针事件（默认值，这里显式写出以示关键） */
   pointer-events: auto;
@@ -682,4 +700,16 @@ button:disabled { background: #3a3a3a; color: #888; cursor: default; }
 .mb-clock {
   font-variant-numeric: tabular-nums;
   opacity: 0.85;
+}
+
+
+/* ==================== 窗口阴影 ====================
+   ⚠️ 阴影不能放在窗口元素上（会被 drawElementImageToTexture 捕获进纹理，
+   圆角处出现深色描边），也不能放在 canvas 下的独立层（圆角透明处会透出它，
+   压在下面窗口的白色内容上同样是深色角）。
+   所以改用 **inset 阴影**：它画在窗口内侧，圆角外侧完全不受影响。 */
+.app-window {
+  box-shadow:
+    inset 0 0 0 1px rgba(0, 0, 0, 0.08),
+    inset 0 1px 0 rgba(255, 255, 255, 0.6);
 }

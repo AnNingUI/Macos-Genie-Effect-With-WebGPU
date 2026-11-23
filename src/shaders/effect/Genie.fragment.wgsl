@@ -119,11 +119,27 @@ fn main_fragment(input : FSIn) -> @location(0) vec4f {
 
   // 换回画布坐标，再映射到纹理 UV
   let srcPx = dir * srcAlong + perp * srcAcross;
+
+  // ---- 保持逐像素对齐（画面清晰度的关键）----
+  //
+  // canvasPx 是片元中心（x+0.5）。(srcPx - rect.xy) / rect.zw 直接就是 WebGPU
+  // 期望的归一化纹理坐标：纹理第 i 个像素中心正好落在 (i+0.5)/W，而这里算出的
+  // 就是这个值。**不要再加减 0.5 做“像素中心校正”** —— 那样反而会造成半像素
+  // 偏移，线性过滤把相邻两像素各取一半，整块画面糊成灰阶。
+  // （实测：偏移 0 / 1.0 时锐度 0.381，偏移 0.5 时掉到 0.216。）
   let uv = (srcPx - p.rect.xy) / p.rect.zw;
 
   if (uv.x < -0.002 || uv.x > 1.002 || uv.y < -0.002 || uv.y > 1.002) {
     discard;
   }
 
-  return textureSample(t, s, uv);
+  let smp = textureSample(t, s, uv);
+
+  // ⚠️ 纹理里存的是 **straight alpha**（rgb 未预乘），但 canvas 配置成了
+  // premultiplied 合成。若直接返回，圆角处那些 a<1 的像素 rgb 仍然很亮
+  // （实测 a=0.33 时 rgb 仍是 168），合成时会当作"已经很亮的不透明色"，
+  // 与背景混合后形成一圈偏暗的三角 —— 这就是圆角处那块"黑边"。
+  //
+  // 这里手动预乘，让 rgb 与 alpha 一致，canvas 的 premultiplied 合成才是正确的。
+  return vec4f(smp.rgb * smp.a, smp.a);
 }

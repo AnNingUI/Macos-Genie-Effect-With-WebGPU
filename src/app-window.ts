@@ -87,13 +87,36 @@ export class AppWindow {
     this.applyRect(rect);
   }
 
+
   /** 把矩形写到 DOM（窗口坐标是相对 canvas 的 CSS 像素）。 */
+  /**
+   * 把矩形写到 DOM。
+   *
+   * ⚠️ 位置和尺寸都对齐到**整数设备像素**。原因是清晰度：
+   * 纹理是按 CSS 尺寸 × DPR 抓的，如果元素落在 x.35 这种半像素位置，
+   * GPU 输出的四边形就会被浏览器重采样到非整数像素格上，
+   * 1px 细节（文字描边）会被线性插值抹成灰阶 —— 整块画面"发虚"。
+   * 对齐到设备像素后，1:1 采样才是真正的逐像素命中。
+   */
   applyRect(rect: Rect): void {
-    this.state.rect = { ...rect };
-    this.el.style.left = `${Math.round(rect.x)}px`;
-    this.el.style.top = `${Math.round(rect.y)}px`;
-    this.el.style.width = `${Math.round(rect.w)}px`;
-    this.el.style.height = `${Math.round(rect.h)}px`;
+    // devicePixelRatio 常常是 1.0000000158945716 这类"近似 1"的值。
+    // 若直接按 1/dpr 网格吸附，会得到 784.1666 这种跨度 —— 元素变成小数尺寸，
+    // 纹理又是整数，两者不等 → 抓取时整体重采样 → 画面发虚。
+    // 所以只在 DPR 明显不是 1 时才吸附到设备像素网格；近似 1 时直接用整数 CSS 像素。
+    const raw = window.devicePixelRatio || 1;
+    const dpr = Math.abs(raw - 1) < 0.01 ? 1 : raw;
+    const snap = (v: number): number => Math.round(v * dpr) / dpr;
+    const snapped: Rect = {
+      x: snap(rect.x),
+      y: snap(rect.y),
+      w: Math.max(1, snap(rect.w)),
+      h: Math.max(1, snap(rect.h)),
+    };
+    this.state.rect = snapped;
+    this.el.style.left = `${snapped.x}px`;
+    this.el.style.top = `${snapped.y}px`;
+    this.el.style.width = `${snapped.w}px`;
+    this.el.style.height = `${snapped.h}px`;
   }
 
   /**
@@ -105,19 +128,22 @@ export class AppWindow {
     // 而 elementImageSize 读的是 offsetWidth —— 不 reflow 会拿到窗口
     // 没有任何尺寸时的 0 或上一次的值，纹理尺寸就错了。
     const measured = { w: this.el.offsetWidth, h: this.el.offsetHeight };
-    const s = elementImageSize(this.canvas, this.el);
-    let w = Math.max(1, Math.ceil(s.width));
-    let h = Math.max(1, Math.ceil(s.height));
-
-    // elementImageSize 在元素还没有 paint 记录时会回退到 offsetWidth × dpr；
-    // 但如果它返回的尺寸明显不是这个元素的（比如等于画布尺寸），用实测值纠正。
     const dpr = window.devicePixelRatio || 1;
-    const expectW = Math.max(1, Math.round(measured.w * dpr));
-    const expectH = Math.max(1, Math.round(measured.h * dpr));
-    if (Math.abs(w - expectW) > 2 || Math.abs(h - expectH) > 2) {
-      w = expectW;
-      h = expectH;
-    }
+
+    // 纹理尺寸必须是**整数设备像素**：state.rect 已经对齐到设备像素，
+    // 所以 rect × dpr 就是整数。用 elementImageSize 的返回值反而可能带小数
+    // （它是 CSS 像素），非整数尺寸 = 采样时必然插值 → 画面发虚。
+    // ⚠️ 必须用 Math.round，不能用 Math.ceil：
+    // devicePixelRatio 常见 1.0000000158945716 这种值，
+    // 256 * dpr = 256.000004，ceil 会得到 257 —— 纹理比元素宽 1 像素，
+    // 于是整块内容被横向拉伸 0.4%，所有 1px 细节都被插值抹平（画面发虚）。
+    let w = Math.max(1, Math.round(this.state.rect.w * dpr));
+    let h = Math.max(1, Math.round(this.state.rect.h * dpr));
+
+    // 兜底：实测尺寸与 state.rect 偏差过大时（如字体/滚动条），用实测值
+    if (Math.abs(w - Math.round(measured.w * dpr)) > 2) w = Math.max(1, Math.round(measured.w * dpr));
+    if (Math.abs(h - Math.round(measured.h * dpr)) > 2) h = Math.max(1, Math.round(measured.h * dpr));
+    void elementImageSize;
 
     if (this.texture && w === this.texSize.width && h === this.texSize.height) return false;
 

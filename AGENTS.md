@@ -98,11 +98,11 @@ node scripts/dpr-check.mjs     # 需先启动 dev server
 
 已实现：
 
-- **行进轴只有 4 个**（上 / 下 / 左 / 右，见 `GENIE_DIRECTIONS`）。
-  斜向方向（downLeft 等）刻意映射到最近的主轴，**只改变目标位置**、不旋转坐标系 ——
-  真实 macOS 里漏斗永远沿屏幕主轴收窄，斜向只是图标在角落。
+- **方向只有 4 个**（上 / 下 / 左 / 右，见 `GENIE_DIRECTIONS`），
+  且**由 Dock 停靠边决定**（`DOCK_EDGE_TO_DIRECTION`），不是用户单独选的。
+  底→down、顶→up、左→left、右→right；左右两侧是纵向 Dock（GNOME 风格）。
 - **目标位置与行进轴解耦**：目标由 `targetRect` 决定，可以落任意位置，
-  不限于八宫格上的 8 个点（为「Dock 有任意多个图标」留的余地）。
+  不限于 Dock 图标所在的几个点（为「Dock 有任意多个图标」留的余地）。
 - **非全屏窗口**：窗口尺寸/位置与 canvas 解耦（`layoutWindow` 按 `windowMode` 布局），
   目标贴的是**画布（屏幕）边缘**，不是窗口边缘。
 - **多窗口**：Notes + Calculator，各自独立的纹理 / uniform / 最小化状态，
@@ -138,6 +138,23 @@ node scripts/dpr-check.mjs     # 需先启动 dev server
 3. **Dock 必须在画布范围内**。Dock 若挂在画布下方（`bottom: -72px`），
    目标点会跑到画布外，漏斗收进画布外面看不见。现在 Dock 浮在画布内底部。
 
+## 画面清晰度的四个坑（都已踩过，会让整块画面"发虚"）
+
+判断方法：在窗口里放一个 `background-size: 8px 8px` 的棋盘，
+截图后量该区域的 min/max —— 正常应接近 0/255；如果收缩成 80/240 就是被重采样了。
+
+1. **纹理尺寸必须用 `Math.round`，不能用 `Math.ceil`**。
+   `devicePixelRatio` 常常是 `1.0000000158`，`256 * dpr = 256.000004`，
+   `ceil` 得到 257 —— 纹理比元素宽 1px，整块内容被拉伸 0.4%，1px 细节全被插值抹平。
+2. **元素尺寸要落在整数设备像素**。`applyRect` 里按 `1/dpr` 网格吸附；
+   但 DPR 近似 1（差 < 0.01）时直接当 1 处理，否则会算出 784.1666 这种跨度。
+3. **页面布局不要产生亚像素位置**。`min-height: 100vh` 在 721px 视口下解析成
+   720.833，stage 被推到 `y=7.995`；canvas 落在亚像素格上，浏览器合成时
+   会整块重采样。改用 `padding` + `flex` 居中的整数方案。
+4. **片元 uv 不要自己加减 0.5**。`(srcPx - rect.xy) / rect.zw` 得到的已经是
+   WebGPU 期望的坐标（纹理第 i 个像素中心在 `(i+0.5)/W`）。实测偏移 0.5 时
+   棋盘对比度从 252 掉到 109。
+
 ## 非全屏窗口的三个坑（都已踩过）
 
 1. **`layoutWindow` 不能用 `renderScale.cssW` 当基准**。resize 过程中它可能还没更新，
@@ -147,6 +164,57 @@ node scripts/dpr-check.mjs     # 需先启动 dev server
    ⚠️ 不能加 `size` —— 那会让 canvas 不再跟随 `width/height:100%` 重新布局，后备缓冲卡死。
 3. **目标必须相对画布算**。旧实现拿 `windowRect` 推目标，窗口一小目标就跑到窗口边上；
    真实场景里 Dock 在屏幕边缘，与窗口大小无关。
+
+## 圆角黑边（alpha 与混合）
+
+这是本项目最难找的一个 bug，**两个原因叠加**，只修一个都还在。
+
+### 症状
+窗口圆角处出现深色三角，**只在窗口叠在另一个窗口上（或桌面背景）时可见**，
+单独放在空白背景上时不明显 —— 这个特征直接指向"合成"而不是"纹理"。
+
+### 原因 1：渲染管线没开混合
+`targets: [{ format }]` 不写 `blend` 时默认是**覆盖写**。后画的窗口四边形会把
+先画的整块盖掉，包括它自己圆角外那些 `a=0`、预乘后 `rgb=0` 的透明像素 ——
+覆盖上去就是黑色。
+
+```ts
+targets: [{
+  format: this.canvasFormat,
+  blend: {
+    color: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+    alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+  },
+}]
+```
+
+这就是 premultiplied 源的 over 合成：`rgb = src + dst*(1-src.a)`。
+
+### 原因 2：straight / premultiplied 语义不一致
+`drawElementImageToTexture` 抓出来的是 **straight alpha**（rgb 未预乘），
+而 canvas 配置成 `alphaMode: "premultiplied"`。直接返回采样值，
+半透明像素的 rgb 仍然很亮（实测 `a=0.33` 时 rgb 还是 168），
+按预乘解释就会过度放大亮度。修法是在片元里手动预乘：
+
+```wgsl
+let smp = textureSample(t, s, uv);
+return vec4f(smp.rgb * smp.a, smp.a);
+```
+
+### 配套
+- canvas 必须 `alphaMode: "premultiplied"`（`"opaque"` 会直接丢 alpha，圆角画成纯黑）
+- 清屏色用 `a: 0`
+
+### 排查方法（这次真正有效的）
+1. 把 `#stage` 背景改成**品红**：能区分「透出背景」和「画了黑色」。
+2. 临时改片元为 `return vec4f(smp.rgb, 1.0)` 读原始 RGB，
+   再改成 `return vec4f(smp.a, smp.a, smp.a, 1.0)` 读 alpha。
+   若 `a≈0.33` 处 `rgb` 仍是 168 → 确诊 straight/premultiplied 不一致。
+3. 检查 `blend` 是否配置 —— 漏了它就是覆盖写。
+
+### 走过的弯路（都不是根因）
+改 `box-shadow` 颜色看是否被捕获、加 canvas 外部阴影层、用 mask/clip-path 挖空、
+怀疑 `#stage` 背景太深。这些只解释了部分观感，真因是混合与预乘。
 
 ## 常见问题
 
