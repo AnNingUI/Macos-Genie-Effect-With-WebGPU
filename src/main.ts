@@ -1,5 +1,6 @@
 import genie_f from "./shaders/effect/Genie.fragment.wgsl?raw";
 import genie_v from "./shaders/effect/Genie.vertex.wgsl?raw";
+import smoke_code from "./shaders/effect/Smoke.wgsl?raw";
 import {
   DEFAULT_TIMING,
   DOCK_EDGE_TO_DIRECTION,
@@ -122,10 +123,16 @@ class GenieApp {
   canvas: HTMLCanvasElement;
 
   pipeline: GPURenderPipeline | null = null;
+  /** 关窗烟雾消散管线（与 Genie 共用 group 0） */
+  dissolvePipeline: GPURenderPipeline | null = null;
+  /** 两个管线共用的 group 0 布局 */
+  private group0Layout: GPUBindGroupLayout | null = null;
   sampler: GPUSampler | null = null;
 
-  /** 所有 App 窗口（数组顺序即绘制顺序） */
+  /** 所有 App 窗口（稳定数组，用于遍历 / 初始化） */
   windows: AppWindow[] = [];
+  /** 唯一的层级顺序：底 → 顶。DOM z-index 与 WebGPU 绘制都使用它。 */
+  windowOrder: AppWindow[] = [];
   /** 当前聚焦窗口：最小化按钮 / 滑杆作用于它 */
   activeWindow: AppWindow | null = null;
 
@@ -141,6 +148,10 @@ class GenieApp {
   windowMode: "full" | "windowed" | "offset" = "full";
 
   private animating = new Set<AppWindow>();
+  /** 正在烟雾消散的窗口 */
+  private dissolving = new Set<AppWindow>();
+  private dissolveRaf: number | null = null;
+  private dissolveFallback: number | null = null;
   private animationId: number | null = null;
   private animationFallbackId: number | null = null;
   private resizeRaf: number | null = null;
@@ -169,8 +180,21 @@ class GenieApp {
 
     const module = this.device.createShaderModule({ code: genie_v + genie_f });
 
+    // 显式 layout：genie 与烟雾消散两条管线共用 group 0（同一份 uniform + 纹理 + 采样器）。
+    // 用 "auto" 的话 GPU 会生成"属于某个管线"的 layout，别的管线不能复用，
+    // 报 "created as part of a pipeline's default layout"。
+    this.group0Layout = this.device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
+      ],
+    });
+
     this.pipeline = this.device.createRenderPipeline({
-      layout: "auto",
+      layout: this.device.createPipelineLayout({
+        bindGroupLayouts: [this.group0Layout],
+      }),
       vertex: { module, entryPoint: "main_vertex" },
       fragment: {
         module, entryPoint: "main_fragment",
@@ -199,6 +223,29 @@ class GenieApp {
       },
       primitive: { topology: "triangle-list" },
     });
+
+    // 关窗烟雾消散：单四边形、逐像素 FBM。与 Genie 共用同一个显式 group 0 布局。
+    // 不能借 auto layout 的 BindGroupLayout，必须复用 this.group0Layout。
+    {
+      const sm = this.device.createShaderModule({ code: smoke_code });
+      const layout = this.device.createPipelineLayout({ bindGroupLayouts: [this.group0Layout!] });
+      this.dissolvePipeline = this.device.createRenderPipeline({
+        layout,
+        vertex: { module: sm, entryPoint: "vs_main" },
+        fragment: {
+          module: sm,
+          entryPoint: "fs_main",
+          targets: [{
+            format: this.canvasFormat,
+            blend: {
+              color: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+              alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+            },
+          }],
+        },
+        primitive: { topology: "triangle-list" },
+      });
+    }
 
     this.createWindows();
     this.layoutWindows();
@@ -231,8 +278,9 @@ class GenieApp {
       new AppWindow(this.device, this.canvas, notesEl, "notes", "Notes", { x: 0, y: 0, w: 640, h: 440 }),
       new AppWindow(this.device, this.canvas, calcEl, "calc", "Calculator", { x: 0, y: 0, w: 260, h: 360 }),
     ];
+    this.windowOrder = [...this.windows];
     this.activeWindow = this.windows[0];
-    this.windows[0].el.classList.add("is-focused");
+    this.applyStacking();
   }
 
   /**
@@ -338,11 +386,18 @@ class GenieApp {
     else if (nearest === "left") left = Math.max(left, d.x + d.w);
     else right = Math.max(right, W - d.x);
 
+    // ⚠️ 向内取整：left/top 向下取、右/下边向上取，保证结果不超出画布。
+    // 之前用小数 + Math.round 组合，在 721px 这类视口会出现窗口比 visibleFrame
+    // 宽 0.3px 的情况，导致窗口压住 Dock（回归里间歇性失败）。
+    const x = Math.ceil(left);
+    const y = Math.ceil(top);
+    const rightEdge = Math.floor(W - right);
+    const bottomEdge = Math.floor(H - bottom);
     return {
-      x: left,
-      y: top,
-      w: Math.max(80, W - left - right),
-      h: Math.max(120, H - top - bottom),
+      x,
+      y,
+      w: Math.max(80, rightEdge - x),
+      h: Math.max(120, bottomEdge - y),
     };
   }
 
@@ -545,6 +600,9 @@ class GenieApp {
     for (const w of this.windows) {
       // 交通灯
       for (const light of w.el.querySelectorAll<HTMLButtonElement>("[data-action]")) {
+        if (light.dataset.action === "close") {
+          light.addEventListener("pointerdown", (ev) => ev.stopPropagation());
+        }
         light.addEventListener("click", (ev) => {
           ev.stopPropagation();
           const action = light.dataset.action;
@@ -708,37 +766,165 @@ class GenieApp {
     window.addEventListener("pointerup", up, { once: true });
   }
 
-  focusWindow(w: AppWindow): void {
-    if (this.activeWindow === w) return;
-    this.activeWindow = w;
-    for (const other of this.windows) {
-      other.el.classList.toggle("is-focused", other === w);
+  /** 把当前层级顺序同步到 DOM。WebGPU 在 draw() 中直接使用同一个 windowOrder。 */
+  private applyStacking(): void {
+    for (let i = 0; i < this.windowOrder.length; i++) {
+      const w = this.windowOrder[i];
+      w.el.style.zIndex = String(this.zCounter + i);
+      w.el.classList.toggle("is-focused", w === this.activeWindow);
     }
-    w.el.style.zIndex = String(++this.zCounter);
+  }
+
+  focusWindow(w: AppWindow): void {
+    // 即使它已经是 activeWindow，也必须真正移动到顶层：
+    // 初始状态就是 Notes 聚焦、Calculator 位于其上，点击 Notes 不能提前 return。
+    this.activeWindow = w;
+    const i = this.windowOrder.indexOf(w);
+    if (i >= 0) this.windowOrder.splice(i, 1);
+    this.windowOrder.push(w);
+    this.applyStacking();
     this.updateDockIndicators();
     this.syncMenubar();
+    this.present();
   }
 
   // ---------------------------------------------------------------- 窗口动作
 
+  /**
+   * 绿灯：最大化 / 还原，带一段"晃动"过渡。
+   *
+   * 为什么不用 CSS transition：窗口的几何直接决定 genie 的 from 矩形与纹理尺寸，
+   * 逐帧改变尺寸时必须同步重建纹理，否则内容会被拉伸。所以这里用 rAF 驱动，
+   * 位置/尺寸走缓动，中途做一次很轻的横向摆动（像被"甩"到位），
+   * 末段加一点过冲再回落。
+   */
   toggleMaximize(w: AppWindow): void {
+    const from = { ...w.state.rect };
+    let to: Rect;
     if (w.state.maximized && w.state.restoreRect) {
-      w.applyRect(w.state.restoreRect);
+      to = { ...w.state.restoreRect };
       w.state.maximized = false;
       w.state.restoreRect = null;
     } else {
       // 最大化到 visible frame，而不是整块画布 —— 不盖菜单栏和 Dock
-      w.state.restoreRect = { ...w.state.rect };
-      w.applyRect(this.visibleFrame());
+      w.state.restoreRect = { ...from };
+      to = this.visibleFrame();
       w.state.maximized = true;
     }
-    this.refreshWindowTexture(w);
-    requestPaint(this.canvas);
-    this.present();
+
+    // 上一次晃动还没结束就打断它
+    if (w.wobbleRaf !== null) {
+      cancelAnimationFrame(w.wobbleRaf);
+      w.wobbleRaf = null;
+    }
+
+    const start = performance.now();
+    const dur = 380;
+    const dx = to.x - from.x;
+    const dy = to.y - from.y;
+    const dw = to.w - from.w;
+    const dh = to.h - from.h;
+
+    const step = (): void => {
+      const t = Math.min(1, (performance.now() - start) / dur);
+      // 主缓动：先快后慢
+      const e = 1 - Math.pow(1 - t, 3);
+      // 过冲：末段 6% 的轻微超出再回落（幅度按位移比例，最大 6px）
+      const overshoot = Math.sin(t * Math.PI) * 0.012 * (t < 0.85 ? 1 : -0.5);
+      // 晃动：横向阻尼摆动，幅度随尺寸变化的时间衰减
+      const sway = Math.sin(t * Math.PI * 2.2) * Math.exp(-t * 4) * Math.min(6, Math.abs(dx) * 0.04);
+
+      const rect: Rect = {
+        x: from.x + dx * e + sway + dx * overshoot,
+        y: from.y + dy * e,
+        w: Math.max(160, from.w + dw * e),
+        h: Math.max(120, from.h + dh * e),
+      };
+      w.applyRect(rect);
+      this.refreshWindowTexture(w);
+      this.present();
+
+      if (t < 1) {
+        w.wobbleRaf = requestAnimationFrame(step);
+      } else {
+        w.wobbleRaf = null;
+        w.applyRect(to);
+        this.refreshWindowTexture(w);
+        requestPaint(this.canvas);
+        this.present();
+      }
+    };
+    w.wobbleRaf = requestAnimationFrame(step);
+
+    // rAF 被节流时兜底（否则窗口会停在变形中间）
+    if (w.wobbleFallback !== null) clearTimeout(w.wobbleFallback);
+    const fallback = (): void => {
+      if (w.wobbleRaf === null) return;
+      const elapsed = performance.now() - start;
+      if (elapsed >= dur) {
+        w.wobbleRaf = null;
+        w.applyRect(to);
+        this.refreshWindowTexture(w);
+        requestPaint(this.canvas);
+        this.present();
+        return;
+      }
+      w.wobbleFallback = window.setTimeout(fallback, 50);
+    };
+    w.wobbleFallback = window.setTimeout(fallback, 60);
   }
 
-  /** 红灯：隐藏窗口，并在 Dock 上标记为已最小化（可直接点图标还原）。 */
+  /**
+   * 红灯：烟雾消散（移植 niri close_color）。
+   *
+   * 单个窗口四边形，片元中用 FBM 做湍流位移、逐像素溶解、边界烟絮与去饱和。
+   * 不再有粒子几何，也不需要额外的顶点缓冲或 compute pass。
+   *
+   * 动画结束后窗口隐藏，Dock 图标标记为已关闭（点它可以重开）。
+   */
   closeWindow(w: AppWindow): void {
+    if (w.state.dissolve !== null) return;   // 已经在消散
+    if (w.state.minimized) return;
+
+    // 保持原层级；draw() 会把烟雾画在它实际所在的位置。
+    w.state.dissolve = 0;
+    this.dissolving.add(w);
+
+    infoEl.textContent = w.name + " 正在消散…";
+    const start = performance.now();
+    const dur = 1800;
+
+    const tick = (): void => {
+      const t = Math.min(1, (performance.now() - start) / dur);
+      w.state.dissolve = t;
+      this.present();
+      if (t < 1) {
+        this.dissolveRaf = requestAnimationFrame(tick);
+      } else {
+        this.finishDissolve(w);
+      }
+    };
+    this.dissolveRaf = requestAnimationFrame(tick);
+
+    // rAF 在后台/无头环境会被节流，动画会永远跑不完 → 窗口永远关不掉。
+    // 用定时器兜底：只要发现进度落后于真实时间，就补一帧。
+    if (this.dissolveFallback !== null) clearTimeout(this.dissolveFallback);
+    const fallback = (): void => {
+      if (w.state.dissolve === null) return;
+      if (w.state.dissolve * dur < performance.now() - start - 120) tick();
+      this.dissolveFallback = window.setTimeout(fallback, 50);
+    };
+    this.dissolveFallback = window.setTimeout(fallback, 50);
+  }
+
+  private finishDissolve(w: AppWindow): void {
+    this.dissolving.delete(w);
+    this.dissolveRaf = null;
+    if (this.dissolveFallback !== null) {
+      clearTimeout(this.dissolveFallback);
+      this.dissolveFallback = null;
+    }
+    w.clearDissolve();
     w.el.style.visibility = "hidden";
     w.state.minimized = true;
     w.state.playhead = 1;
@@ -791,9 +977,15 @@ class GenieApp {
 
   /** 从 Dock 还原：playhead 从 1 倒放到 0（genie 反向）。 */
   restoreWindow(w: AppWindow): void {
-    if (this.animating.has(w)) return;
+    // 正在跑最小化动画时点 Dock：直接接管，不要让这次点击被静默丢弃
+    // （旧写法 `if (this.animating.has(w)) return;` 会让窗口卡在 minimized）。
+    if (this.animating.has(w)) this.stopAnimation();
     this.focusWindow(w);
     w.el.style.visibility = "";
+    // 从烟雾关闭状态还原：清掉消散进度，否则 draw() 仍走烟雾分支，窗口不会出现。
+    if (w.state.dissolve !== null) {
+      w.clearDissolve();
+    }
     this.animating.add(w);
     genieBtn.disabled = true;
     infoEl.textContent = w.name + " 正在从 Dock 展开…";
@@ -848,7 +1040,26 @@ class GenieApp {
 
   resetAll(): void {
     this.stopAnimation();
+    // 消散中的窗口也要复位：清掉进度，否则会卡在烟雾分支
+    if (this.dissolveFallback !== null) {
+      clearTimeout(this.dissolveFallback);
+      this.dissolveFallback = null;
+    }
+    if (this.dissolveRaf !== null) {
+      cancelAnimationFrame(this.dissolveRaf);
+      this.dissolveRaf = null;
+    }
+    this.dissolving.clear();
     for (const w of this.windows) {
+      if (w.wobbleRaf !== null) {
+        cancelAnimationFrame(w.wobbleRaf);
+        w.wobbleRaf = null;
+      }
+      if (w.wobbleFallback !== null) {
+        clearTimeout(w.wobbleFallback);
+        w.wobbleFallback = null;
+      }
+      w.clearDissolve();
       w.state.playhead = 0;
       w.state.minimized = false;
       w.el.style.visibility = "";
@@ -929,6 +1140,12 @@ class GenieApp {
     const viewport = { width: renderScale.pxW, height: renderScale.pxH };
 
     for (const w of this.windows) {
+      // 消散中：写烟雾 uniform，跳过 genie 的几何同步
+      if (w.state.dissolve !== null) {
+        w.prepareDissolveUniforms(dpr, viewport);
+        w.el.style.pointerEvents = "none";
+        continue;
+      }
       const target = this.targetFor(w);
       w.prepare(
         {
@@ -964,10 +1181,13 @@ class GenieApp {
         loadOp: "clear", storeOp: "store",
       }],
     });
-    pass.setPipeline(this.pipeline);
-
-    for (const w of this.windows) {
+    // ⚠️ 普通窗口与烟雾窗口必须在**同一个底→顶循环**里绘制。
+    // 若烟雾单独放到末尾，它会无视层级盖住上面的窗口。
+    for (const w of this.windowOrder) {
       if (!w.bindGroup) continue;
+      const pipeline = w.state.dissolve !== null ? this.dissolvePipeline : this.pipeline;
+      if (!pipeline) continue;
+      pass.setPipeline(pipeline);
       pass.setBindGroup(0, w.bindGroup);
       pass.draw(6);
     }

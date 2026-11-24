@@ -32,6 +32,8 @@ export interface WindowState {
   maximized: boolean;
   /** 最大化前的矩形，用于还原 */
   restoreRect: Rect | null;
+  /** 关窗烟雾消散进度：0 = 完好，1 = 完全消失；null 表示没在播放 */
+  dissolve: number | null;
 }
 
 let uid = 0;
@@ -51,11 +53,18 @@ export class AppWindow {
   uniformBuffer: GPUBuffer;
   bindGroup: GPUBindGroup | null = null;
 
+  /** 绿灯晃动的 rAF 句柄 */
+  wobbleRaf: number | null = null;
+  /** 晃动被 rAF 节流时的兜底定时器 */
+  wobbleFallback: number | null = null;
+
   state: WindowState;
 
   private device: GPUDevice;
   private canvas: HTMLCanvasElement;
   private uniformScratch = new Float32Array(GENIE_UNIFORM_FLOATS);
+  /** 每个窗口固定且可复现的烟雾噪声种子 */
+  private dissolveSeed: number;
 
   constructor(
     device: GPUDevice,
@@ -66,6 +75,7 @@ export class AppWindow {
     rect: Rect,
   ) {
     this.id = `win-${++uid}`;
+    this.dissolveSeed = (uid * 0.731) % 10;
     this.device = device;
     this.canvas = canvas;
     this.el = el;
@@ -77,6 +87,7 @@ export class AppWindow {
       minimized: false,
       maximized: false,
       restoreRect: null,
+      dissolve: null,
     };
 
     this.uniformBuffer = device.createBuffer({
@@ -218,5 +229,40 @@ export class AppWindow {
       this.canvas, this.el,
       vb.x / dpr, vb.y / dpr, vb.w / dpr, vb.h / dpr,
     );
+  }
+
+  // ------------------------------------------------------------ 烟雾消散
+
+  /**
+   * 烟雾消散期间写 uniform。
+   *
+   * 与 Genie 共用同一个 24 float 的 uniform buffer；字段切换到 Smoke.wgsl：
+   * viewport / css / rect / motion(progress, seed)。单四边形，无额外几何。
+   */
+  prepareDissolveUniforms(
+    dpr: number,
+    viewport: { width: number; height: number },
+  ): void {
+    const f = this.uniformScratch;
+    const r = this.state.rect;
+    f.fill(0);
+    f[0] = viewport.width;
+    f[1] = viewport.height;
+    f[2] = r.w;
+    f[3] = r.h;
+    f[4] = r.x * dpr;
+    f[5] = r.y * dpr;
+    f[6] = r.w * dpr;
+    f[7] = r.h * dpr;
+    f[8] = this.state.dissolve ?? 0;
+    f[9] = this.dissolveSeed;
+    if (this.uniformBuffer) {
+      this.device.queue.writeBuffer(this.uniformBuffer, 0, f);
+    }
+  }
+
+  /** 消散结束或还原窗口时清除进度。 */
+  clearDissolve(): void {
+    this.state.dissolve = null;
   }
 }

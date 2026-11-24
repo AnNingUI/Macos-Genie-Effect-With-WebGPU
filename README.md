@@ -12,6 +12,8 @@
 
 - **真实桌面**：菜单栏 + 两个 App 窗口（Notes / Calculator）+ Dock
 - **窗口可交互**：拖标题栏移动、拖右下角缩放、三个交通灯（关 / 最小化 / 最大化）
+- **关窗 = 烟雾消散**：FBM 湍流让像素向上漂移，按各自噪声阈值溶解，边界带烟絮并逐渐去饱和
+- **最大化 / 最小化带晃动过渡**：绿灯切换 fullscreen 时走 380ms 的抖动曲线，不是硬切
 - **Dock 可交互**：点图标最小化 / 还原对应窗口，还原时 genie 反向播放；Dock 可换到四条边
 - **计算器真的能算**：四则运算 / 百分比 / 正负号，除零显示 `Error`
 - **方向由 Dock 位置决定**：Dock 停底/顶/左/右，窗口就往对应方向收
@@ -51,7 +53,8 @@ src/
 ├── wgsl.d.ts                   WGSL 模块类型声明
 └── shaders/effect/
     ├── Genie.vertex.wgsl       顶点：像素 → NDC（6 顶点，覆盖 源∪目标 并集）
-    └── Genie.fragment.wgsl     片元：逆映射（贝塞尔收窄 + 内容压缩）+ discard
+    ├── Genie.fragment.wgsl     片元：逆映射（贝塞尔收窄 + 内容压缩）+ disc
+    └── Smoke.wgsl              关窗烟雾消散：FBM 湍流 + 溶解 + 烟絮 + 去饱和
 scripts/
 ├── genie-check.mjs            纯函数测试（node scripts/genie-check.mjs）
 ├── check.mjs                  CDP：交互回归 + 截图 + 控制台报错
@@ -169,11 +172,12 @@ const availH = H - top - DOCK_AREA;   // visible frame
 
 **窗口**
 
+- **点击任意位置置顶**：DOM z-index 与 WebGPU 绘制共用同一份底→顶顺序；即使窗口已经聚焦，再点它也会真正移到最上层
 - **拖标题栏移动**：直接改 `state.rect` 并即时重绘（窗口位置就是 genie 的 `from` 矩形）
 - **拖右下角缩放**：最小 220×160，不能超出 visible frame；缩放后纹理立即重建
-- **红灯（关闭）**：隐藏窗口，Dock 图标标记为可最小化，点图标可重新打开
+- **红灯（关闭）**：先播 1800ms 烟雾消散，结束后隐藏窗口、Dock 图标标记为已关闭，点图标可重新打开
 - **黄灯（最小化）**：跑 genie 动画收进**自己的** Dock 图标
-- **绿灯（最大化）**：在「当前矩形」和「visible frame」之间切换，记住还原尺寸
+- **绿灯（最大化）**：在「当前矩形」和「visible frame」之间切换，切换过程是 380ms 的晃动过渡（先冲过头再回弹），并记住还原尺寸
 
 **Dock**
 
@@ -216,6 +220,56 @@ const availH = H - top - DOCK_AREA;   // visible frame
 而 `updateElementGeometry` 给的命中区只有包围盒精度。
 `draw()` 在 `playhead > 0` 时设置 `pointer-events: none`，回到 0 立刻清空，
 所以「点复选框、输入文字」这些交互在窗口原样时完全正常。
+
+### 11. 关窗烟雾消散（Smoke）
+
+移植自 niri 的 `close_color`：不做粒子，也不做 CPU 几何，**一个窗口四边形 + 一个片元着色器**
+就完成整段动画。内容先被湍流轻轻托起，再按每个像素自己的噪声阈值消失；边界混一点
+灰色烟絮，同时逐渐去饱和。
+
+![关窗：FBM 湍流与烟雾消散](./md-assets/smoke.gif)
+
+**片元流程（`Smoke.wgsl`）**
+
+1. 两组随时间变化的 FBM 产生 `drift_x / drift_y`，让采样坐标发生湍流位移并向上飘。
+2. `n = fbm(uv * 6 + seed * 3)`，用 `visible = 1 - smoothstep(n-.1, n+.1, p*1.2)`
+   决定该像素是否还可见；`p*1.2` 保证结尾彻底透明。
+3. `wisp = exp(-edge² * 100) * p` 只在溶解边界附近混入 `(0.55, 0.55, 0.6)` 的烟絮。
+4. 随进度混入 30% 灰度；最后按 straight → premultiplied 的规则手动预乘 alpha。
+
+```
+turb  = fbm(uv * 5 + vec2(p*2, -p*3)) - .5
+turb2 = fbm(uv * 3 + vec2(-p*1.5, -p*2) + seed) - .5
+drift = vec2(turb * .15 * p², -.2*p² + turb2*.12*p)
+color = texture(src, clamp(uv + drift, 0, 1))
+```
+
+**与 Genie 共用资源**
+
+- 复用同一个 24 float uniform buffer 和显式 `group0Layout`，只把字段切换为
+  `viewport / css / rect / motion(progress, seed)`。
+- 管线没有顶点缓冲，顶点着色器用 `vertex_index` 生成 6 个顶点，`draw(6)` 即可。
+- 每个窗口使用固定 seed，动画截图可复现；纹理每帧仍来自实时 HTML。
+- 同样是 premultiplied over 混合，否则透明处会重新出现黑边。
+- 普通窗口与烟雾窗口在同一个底→顶循环中绘制；关闭后台窗口不会把它临时提到最上层。
+
+**动画与降级**：1800ms，`state.dissolve` 从 0 到 1。rAF 被节流时用 50ms 定时器兜底补帧。
+结束后隐藏窗口、清空进度；点 Dock 重开前也会 `clearDissolve()`，避免残留烟雾分支。
+
+### 12. 最大化 / 最小化的晃动过渡
+
+绿灯不再瞬间切换矩形，而是 380ms 的抖动曲线：
+
+```
+e = 1 - (1-t)^3                 // 主缓动：先快后慢
+overshoot = sin(t * π * 2.4) * (1-t)^2 * 0.06   // 回弹项，幅度随 t 衰减
+rect = lerp(from, to, e + overshoot)
+```
+
+每一帧都重写 `state.rect` 并重绘；`wobbleRaf` 结束后再对齐一次精确的 `to` 矩形，
+保证终态不因回弹项而偏移。同样带 `setTimeout` 兜底（否则后台标签页会停在中间态）。
+
+还原路径（点 Dock）会先 `clearDissolve()`：烟雾关闭的窗口若残留进度，`draw()` 仍走烟雾分支，表现为「点 Dock 后窗口不出现」。
 
 ## 验证
 

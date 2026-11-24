@@ -302,6 +302,7 @@ check('复用同一个 Float32Array，不额外分配', () => {
   assert.equal(got, scratch);
 });
 
+
 // ---------------------------------------------------------------- 输出
 const width = Math.max(...cases.map((c) => c.name.length));
 for (const c of cases) {

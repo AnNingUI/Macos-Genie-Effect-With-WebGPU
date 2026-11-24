@@ -27,7 +27,8 @@ src/
 ├── wgsl.d.ts
 └── shaders/effect/
     ├── Genie.vertex.wgsl       Params 结构体 + 顶点 → NDC
-    └── Genie.fragment.wgsl     曲线收窄 + 位移 + discard
+    ├── Genie.fragment.wgsl     曲线收窄 + 位移 + discard
+    └── Smoke.wgsl              关窗烟雾消散：FBM 湍流 + 溶解 + 烟絮 + 去饱和
 scripts/
 ├── genie-check.mjs             纯函数测试（无需浏览器）
 ├── check.mjs                   CDP 冒烟：状态、截图、控制台报错
@@ -93,6 +94,32 @@ node scripts/dpr-check.mjs     # 需先启动 dev server
    ⚠️ **DPR 不能用 `matchMedia('(resolution: Xdppx)')` 监听**：
    `devicePixelRatio` 常常是 `1.2000000476837158` 这类值，拼进媒体查询后永远不匹配，
    change 事件再也不会触发（实测 DPR 变化完全失灵）。现在用 500ms 轮询读数值。
+
+## 关窗烟雾消散（Smoke）的注意事项
+
+红灯是**单四边形、逐像素 FBM** 的烟雾消散，移植自 niri `close_color`。
+没有粒子几何、粒子缓冲或 compute pass；公式见 README「### 11. 关窗烟雾消散」。
+
+1. **两条管线必须共用一个显式 group 0 布局**。Genie 与 Smoke 共用同一份
+   uniform buffer / 纹理 / 采样器。绝不能用 `pipeline.getBindGroupLayout(0)`
+   去建另一个管线的 layout —— auto layout 产出的 BindGroupLayout 会被
+   `CreatePipelineLayout` 拒绝。
+
+2. **不要给消散管线挂旧的粒子顶点缓冲**。它由 `vertex_index` 生成 6 个顶点，
+   `draw(6)`；state 只有 `dissolve: number|null`，没有 dustVertices / cell / shard。
+
+3. **alpha 仍需手动预乘**。烟雾 shader 最后必须输出
+   `vec4(rgb * alpha, alpha)`，配合 premultiplied over；不要照抄 GLSL 的
+   `color *= visible` 而忘记 straight/premultiplied 差异。
+
+4. **层级必须只有一份顺序**。`windowOrder` 是底→顶的唯一来源：`focusWindow` 即使面对
+   已聚焦窗口也要把它移到数组末尾；DOM z-index 与 GPU 绘制都从它派生。
+   普通与烟雾窗口在同一个循环中画，不能先画完全部普通窗口再补烟雾 —— 那会让下层窗口的
+   关闭特效盖住上层窗口。红灯的 pointerdown 阻止冒泡，关闭后台窗口不抢焦点、不提层。
+
+5. **改 shader 先查编译信息**：页面里 `getCompilationInfo()`，过滤 `type === 'error'`。
+   真实 UI 流程除了截图，还要等 `state.dissolve === null`，确认窗口隐藏、Dock 标记、
+   点 Dock 能重开。
 
 ## 当前能力边界
 

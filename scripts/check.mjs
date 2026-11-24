@@ -182,6 +182,86 @@ try {
   };
   const json = async (expr) => JSON.parse(await evaluate(expr));
 
+  // ⑪ 红灯 = 烟雾消散：单管线、单四边形，无粒子几何
+  const smoke = await json(`(async () => {
+    const app = window.__app;
+    app.resetAll();
+    await new Promise(r => setTimeout(r, 500));
+    const w = app.windows[1];
+    const before = { pipeline: !!app.dissolvePipeline, hasDustBuffer: 'dustVertices' in w };
+    // 手动驱动一帧，避免后台标签页 rAF 节流影响验证
+    w.state.dissolve = 0.45;
+    app.present();
+    const painted = getComputedStyle(w.el).visibility;
+    w.clearDissolve();
+    app.present();
+    return JSON.stringify({ before, painted, after: w.state.dissolve });
+  })()`);
+  if (!smoke.before.pipeline) failures.push('烟雾消散管线没有创建');
+  if (smoke.before.hasDustBuffer) failures.push('粒子顶点缓冲字段仍未移除');
+  if (smoke.after !== null) failures.push('clearDissolve 后进度应为 null');
+  console.log('=== 回归：红灯烟雾消散（着色器） ===');
+  console.log(JSON.stringify(smoke));
+
+  // ⑫ 点红灯 → 烟雾消散 → 隐藏 + Dock 标记（真实 UI 操作）
+  const smokeFlow = await json(`(async () => {
+    const app = window.__app;
+    const w = app.windows[1];
+    const t0 = performance.now();
+    w.el.querySelector('[data-action="close"]').click();
+    const sync = { after: w.state.dissolve };
+    while (w.state.dissolve !== null && performance.now() - t0 < 8000) {
+      await new Promise(r => setTimeout(r, 60));
+    }
+    return JSON.stringify({
+      sync, elapsed: Math.round(performance.now() - t0),
+      done: {
+        progress: w.state.dissolve,
+        hidden: getComputedStyle(w.el).visibility,
+        minimized: w.state.minimized,
+        dockMin: document.querySelector('[data-dock="calc"]').classList.contains('is-minimized'),
+      },
+    });
+  })()`);
+  console.log('=== 回归：红灯烟雾消散（完整流程） ===');
+  console.log(JSON.stringify(smokeFlow));
+  if (smokeFlow.sync.after !== 0) failures.push('点击红灯后进度应同步为 0: ' + smokeFlow.sync.after);
+  if (smokeFlow.done.progress !== null) failures.push('消散结束后进度应清空');
+  if (smokeFlow.done.hidden !== 'hidden') failures.push('消散结束后窗口应隐藏');
+  if (!smokeFlow.done.minimized) failures.push('消散结束后窗口应标记 minimized');
+  if (!smokeFlow.done.dockMin) failures.push('消散结束后 Dock 图标应标记已关闭');
+
+  // ⑬ 绿灯晃动：过渡过程中间帧必须是「介于原位与全屏之间」的形变矩形
+  const wobble = await json(`(async () => {
+    const app = window.__app;
+    const w = app.windows[1];
+    const before = { ...w.state.rect };
+    const vf = app.visibleFrame();
+    if (w.state.maximized) {
+      w.el.querySelector('[data-action="maximize"]').click();
+      await new Promise(r => setTimeout(r, 600));
+    }
+    w.el.querySelector('[data-action="maximize"]').click();
+    await new Promise(r => setTimeout(r, 600));
+    const done = { ...w.state.rect };
+    const maximized = w.state.maximized;
+    // 还原，避免污染后续用例（缩放、Dock 边）
+    w.el.querySelector('[data-action="maximize"]').click();
+    await new Promise(r => setTimeout(r, 600));
+    return JSON.stringify({ before, vf, done, maximized, after: { ...w.state.rect }, restored: !w.state.maximized });
+  })()`);
+  // 终态必须精确落在 visible frame（不允许盖住菜单栏与 Dock）
+  if (Math.abs(wobble.done.w - wobble.vf.w) > 2 || Math.abs(wobble.done.h - wobble.vf.h) > 2) {
+    failures.push('绿灯没有最大化到 visible frame: ' + JSON.stringify(wobble.done) + ' vs ' + JSON.stringify(wobble.vf));
+  }
+  if (!wobble.maximized) failures.push('绿灯后 maximized 标志未置位');
+  if (!wobble.restored) failures.push('再次点绿灯后应还原为非最大化');
+  if (Math.abs(wobble.after.w - wobble.before.w) > 3) {
+    failures.push('还原后宽度没有回到原位: ' + JSON.stringify(wobble.after) + ' vs ' + JSON.stringify(wobble.before));
+  }
+  console.log('=== 回归：绿灯晃动 ===');
+  console.log(JSON.stringify(wobble));
+
   // ① 拖动标题栏
   const dragged = await json(`(() => {
     const app = window.__app;
@@ -282,18 +362,30 @@ try {
   console.log(JSON.stringify(restored));
 
   // ⑤ 红灯关闭 / 绿灯最大化还原
-  const lights = await json(`(() => {
+  // 绿灯是 380ms 晃动过渡、红灯是 1800ms 烟雾消散 —— 都要等动画结束再断言
+  const lights = await json(`(async () => {
     const app = window.__app;
     const w = app.windows[1];
+    const wait = (ms) => new Promise(r => setTimeout(r, ms));
+    const waitFor = async (pred, limit) => {
+      const t0 = performance.now();
+      while (!pred() && performance.now() - t0 < limit) await wait(30);
+    };
     const before = { ...w.state.rect };
     w.el.querySelector('[data-action="maximize"]').click();
+    await waitFor(() => w.wobbleRaf === null && Math.abs(w.state.rect.w - app.visibleFrame().w) < 2, 2500);
     const max = { ...w.state.rect };
+    const maximized = w.state.maximized;
     w.el.querySelector('[data-action="maximize"]').click();
+    await waitFor(() => w.wobbleRaf === null && Math.abs(w.state.rect.w - before.w) < 3, 2500);
     const back = { ...w.state.rect };
+    const restoredUp = w.state.maximized;
     w.el.querySelector('[data-action="close"]').click();
+    await waitFor(() => w.state.dissolve === null && getComputedStyle(w.el).visibility === 'hidden', 6000);
     const closed = { visibility: getComputedStyle(w.el).visibility, minimized: w.state.minimized };
     document.querySelector('[data-dock="calc"]').click();
-    return JSON.stringify({ before, max, back, closed });
+    await waitFor(() => w.state.playhead <= 0.001, 6000);
+    return JSON.stringify({ before, max, maximized, back, restoredUp, closed });
   })()`);
   // 绿灯最大化到 visible frame（不盖菜单栏和 Dock），不是整块画布
   const vf = await json(`JSON.stringify(window.__app.visibleFrame())`);
@@ -316,6 +408,45 @@ try {
   console.log(JSON.stringify(lights));
 
   // ⑥ 计算器真的会算（同步点击，避免页面内 await 卡住 CDP）
+  // ⑭ 窗口层级：点击置顶，且关闭烟雾留在原层级
+  const stacking = await json(`(async () => {
+    const app = window.__app;
+    app.resetAll();
+    const [notes, calc] = app.windows;
+    const down = (w, selector) => w.el.querySelector(selector).dispatchEvent(
+      new PointerEvent('pointerdown', { bubbles: true, pointerId: 21, pointerType: 'mouse' })
+    );
+    down(calc, '.calc-display');
+    down(notes, '.content');
+    const raised = {
+      order: app.windowOrder.map(w => w.dockId),
+      active: app.activeWindow.dockId,
+      z: app.windows.map(w => [w.dockId, Number(w.el.style.zIndex)]),
+    };
+    down(calc, '.calc-display');
+    notes.el.querySelector('[data-action="close"]').click();
+    const closing = {
+      order: app.windowOrder.map(w => w.dockId),
+      active: app.activeWindow.dockId,
+      progress: notes.state.dissolve,
+    };
+    app.resetAll();
+    return JSON.stringify({ raised, closing });
+  })()`);
+  if (stacking.raised.order.join(',') !== 'calc,notes') {
+    failures.push('点击 Notes 后没有移动到渲染顶层: ' + stacking.raised.order);
+  }
+  if (stacking.raised.active !== 'notes') failures.push('点击 Notes 后焦点不对');
+  const zn = Object.fromEntries(stacking.raised.z);
+  if (!(zn.notes > zn.calc)) failures.push('Notes 的 DOM z-index 没有高于 Calculator');
+  if (stacking.closing.order.join(',') !== 'notes,calc') {
+    failures.push('关闭下层 Notes 时烟雾被提到了顶层: ' + stacking.closing.order);
+  }
+  if (stacking.closing.active !== 'calc') failures.push('关闭后台窗口不应抢走焦点');
+  if (stacking.closing.progress !== 0) failures.push('点击红灯后没有进入烟雾消散');
+  console.log('=== 回归：窗口层级与烟雾顺序 ===');
+  console.log(JSON.stringify(stacking));
+
   await evaluate(`window.__app.resetAll(); 'ok'`);
   await sleep(300);
   const pressSync = async (keys) => {
@@ -383,8 +514,9 @@ try {
     edges.push(info);
   }
   const EXPECT = { bottom: 'down', top: 'up', left: 'left', right: 'right' };
-  const canvasW = 800;
-  const canvasH = 600;
+  // 画布尺寸随视口扩展，从 DOM 实测，不写死 800×600
+  const canvasW = await evaluate(`document.getElementById('webgpu-canvas').getBoundingClientRect().width`);
+  const canvasH = await evaluate(`document.getElementById('webgpu-canvas').getBoundingClientRect().height`);
   for (const e of edges) {
     if (e.edge !== e.edge) failures.push('Dock 边未生效');
     if (e.dir !== EXPECT[e.edge]) failures.push(e.edge + ' 边应为 ' + EXPECT[e.edge] + ' 方向，实际 ' + e.dir);

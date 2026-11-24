@@ -20,8 +20,12 @@ body {
 #stage {
   position: relative;
   flex: 0 0 auto;
-  width: 800px;
-  height: 600px;
+  /* 大画布：尽量利用视口，同时给底部控制栏与提示留 ~112px。
+     1280×720 时约 1180×608；更大视口最多 1180×760。 */
+  width: round(down, min(1180px, calc(100vw - 32px)), 1px);
+  height: round(down, min(760px, calc(100vh - 112px)), 1px);
+  min-width: 640px;
+  min-height: 420px;
   /* 用 outline 代替 border：border 会挤占内容盒，
      让 canvas 的实际 CSS 尺寸变成 796×596，与后备缓冲 800×600 不一致 → 拉伸模糊 */
   outline: 2px solid #444;
